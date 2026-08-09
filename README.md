@@ -1,0 +1,175 @@
+<h1 align="center">pi-tools-style</h1>
+
+<p align="center"><strong>Give Pi tool activity clear, theme-aware structure without changing how tools run.</strong></p>
+
+`pi-tools-style` adds rounded frames, tool-specific icons, and live running indicators to Pi tool calls and direct shell commands. It decorates the output Pi already produces instead of replacing tool definitions or renderers.
+
+Built-in tools, MCP integrations, AFT, and third-party extensions keep control of their schemas, permissions, prompts, execution backends, and rendered content. When an output cannot be framed safely, the extension leaves it untouched.
+
+## Highlights
+
+- **Presentation without ownership** — wraps existing TUI output and never registers or replaces a tool.
+- **Theme-aware borders** — assigns semantic Pi theme colors by tool category and follows theme changes live.
+- **Three icon modes** — uses portable ASCII labels by default, richer Nerd Font glyphs when enabled, or icon-free titles.
+- **Live running state** — animates the title while a model tool call is still executing, then removes the spinner on completion.
+- **Terminal-correct sizing** — measures visible ANSI width before padding, truncating, or drawing borders.
+- **Renderer-friendly composition** — preserves Pi, AFT, MCP, and extension-provided output inside the frame.
+- **Image-safe fallback** — skips Kitty, iTerm2, and Sixel rows instead of corrupting terminal image sequences.
+- **Reload-safe state** — keeps wrappers and runtime configuration idempotent across `/reload`.
+
+## What it looks like
+
+ASCII mode stays readable in any terminal:
+
+```text
+╭─ [F] | read / ───────────────────────╮
+│ Reading README.md                    │
+╰──────────────────────────────────────╯
+```
+
+Nerd Font mode uses tool-specific glyphs and Braille spinner frames:
+
+```text
+╭─  | read ⠹ ─────────────────────────╮
+│ Reading README.md                    │
+╰──────────────────────────────────────╯
+```
+
+Once execution finishes, the spinner disappears and the title remains stable:
+
+```text
+╭─  | read ───────────────────────────╮
+│ README content                       │
+╰──────────────────────────────────────╯
+```
+
+Direct `!` and `!!` commands use the same frame with a `shell` title. Slash-command output remains unchanged because Pi does not expose one uniform transcript component for slash commands.
+
+## Installation
+
+The current release targets Pi `0.84.x` and requires Node.js 22 or newer.
+
+To install this checkout as a local Pi package:
+
+```bash
+cd /absolute/path/to/pi-tools-style
+npm install --legacy-peer-deps
+pi install "$(pwd)"
+```
+
+Pi stores the package in user settings and references the directory directly, so local changes become available after `/reload` or a restart.
+
+To install it only for the current project, run this from that project:
+
+```bash
+pi install -l /absolute/path/to/pi-tools-style
+```
+
+To try the extension without installing it:
+
+```bash
+pi -e /absolute/path/to/pi-tools-style/index.ts
+```
+
+Once the package is published to npm, it can also be installed with:
+
+```bash
+pi install npm:@anthodev/pi-tools-style
+```
+
+## Usage
+
+Boxes start enabled. Manage them from Pi with:
+
+```text
+/tools-style
+/tools-style on
+/tools-style off
+/tools-style icons ascii
+/tools-style icons nerd-font
+/tools-style icons off
+/tstyle
+```
+
+`/tools-style` toggles framing. `/tstyle` is a short alias with the same arguments. The explicit `on` and `off` forms set the desired state without depending on its current value.
+
+Icon mode persists in `~/.pi/agent/config/tools-style.json`. ASCII remains the package default; Nerd Font mode can be enabled once for terminals that provide the required glyphs. `icons off` keeps frames and the ASCII running spinner, but removes the static icon and its `|` separator from titles.
+
+```json
+{
+  "iconMode": "nerd-font"
+}
+```
+
+Set `PI_TOOLS_STYLE=0` before startup to load the extension with framing disabled.
+
+## Icons and running indicators
+
+Common tools receive dedicated icons, while unknown tools fall back to their semantic category.
+
+| Purpose | ASCII | Nerd Font | Examples |
+| --- | --- | --- | --- |
+| Read a file | `[F]` | `` | `read`, `read_symbol` |
+| Write a file | `[W]` | `` | `write` |
+| Edit content | `[E]` | `` | `replace`, `apply_patch` |
+| Run a command | `[$]` | `` | `bash`, shell tools |
+| Search | `[?]` | `` | `symbol_search`, `grep` |
+| Use the web | `[@]` | `` | `web_search`, browser tools |
+| Fetch content | `[v]` | `` | `fetch_content` |
+| Call MCP | `[M]` | `` | `mcp`, `mcpScript` |
+| Orchestrate work | `[*]` | `` | `workflow`, `subagent` |
+| Track tasks | `[#]` | `` | `todo` |
+| Ask the user | `[!]` | `` | `ask_user`, confirmation tools |
+| Show diagnostics | `[D]` | `` | `lsp_diagnostics`, `lens_diagnostics` |
+| Unknown tool | `[T]` | `` | third-party fallback |
+
+While a model tool call is active, ASCII mode cycles through `| / - \` and Nerd Font mode cycles through `⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏`. One shared timer drives all active titles and stops after completion, interruption, box disablement, stale transcript removal, or session shutdown.
+
+## Theme-aware palette
+
+Borders resolve their color from the active Pi theme on every render. Switching themes therefore updates existing tool categories without reloading the extension.
+
+| Category | Typical tools | Pi theme token |
+| --- | --- | --- |
+| Inspect | reads, searches, reports, diagnostics | `mdLink` |
+| Mutate | writes, edits, create/update/delete operations | `warning` |
+| Execute | bash, shell, tests, terminal commands | `bashMode` |
+| External | web, fetch, MCP, browser, GitHub, Slack | `syntaxType` |
+| Orchestrate | workflow, subagent, Ralph, todo | `customMessageLabel` |
+| Interact | ask, question, confirm, select | `accent` |
+| Other | unknown third-party tools | `borderMuted` |
+
+## How it works
+
+Pi `0.84.x` does not expose public render middleware around `ToolExecutionComponent` and `BashExecutionComponent`. `pi-tools-style` therefore installs a narrow wrapper around their existing `render()` methods.
+
+The wrapper asks the previous renderer to draw at the frame's inner width, removes only paired outer horizontal rules, and then adds ANSI-aware chrome. It does not call `pi.registerTool()`, replace tool definitions, or intercept execution.
+
+Configuration and animation state live behind `Symbol.for()` keys. Reloading updates the active configuration without stacking wrappers or leaving duplicate timers behind. Any incompatibility or decoration error falls back to Pi's original full-width renderer.
+
+## Compatibility and limits
+
+- Pi `0.84.x` is the supported target. Private TUI internals may change in later releases.
+- The render wrapper is necessarily unsupported until Pi exposes public, composable render middleware.
+- Kitty, iTerm2, and Sixel image output remains unboxed by design.
+- Slash commands remain outside the current scope because their transcript output has no uniform component.
+- Another extension can replace this wrapper if it overwrites component rendering without composing with the previous renderer.
+- Unsupported renderer shapes fail open rather than affecting tool execution.
+
+## Development
+
+Install dependencies and run the complete verification suite with:
+
+```bash
+npm install --legacy-peer-deps
+npm run check
+npm pack --dry-run --json
+```
+
+`npm run check` runs TypeScript validation and the Vitest suite. Tests cover frame width, ANSI output, terminal images, native and AFT rule removal, category colors, icon modes, persisted settings, spinner lifecycle, real `ToolExecutionComponent` integration, render composition, reload idempotence, fail-open behavior, and the no-`registerTool()` contract.
+
+`--legacy-peer-deps` avoids an npm 10.9.8 Arborist failure observed while resolving the development peer dependency graph.
+
+## License
+
+MIT

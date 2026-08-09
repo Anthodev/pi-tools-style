@@ -1,0 +1,51 @@
+{
+  "name": "@anthodev/pi-tools-style",
+  "version": "0.1.0",
+  "description": "Presentation-only boxes for Pi tool calls and shell commands",
+  "keywords": ["pi-package", "pi-extension", "tui", "tools"],
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Anthodev/pi-tools-style.git"
+  },
+  "homepage": "https://github.com/Anthodev/pi-tools-style#readme",
+  "bugs": {
+    "url": "https://github.com/Anthodev/pi-tools-style/issues"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "pack:check": "npm pack --dry-run --json",
+    "prepublishOnly": "npm run check"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.x",
+    "@earendil-works/pi-tui": "0.84.x"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-tui": "0.84.1",
+    "@types/node": "24.12.0",
+    "typescript": "5.9.3",
+    "vitest": "4.1.9"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
