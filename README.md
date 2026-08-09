@@ -2,6 +2,12 @@
 
 <p align="center"><strong>Give Pi tool activity clear, theme-aware structure without changing how tools run.</strong></p>
 
+<p align="center">
+  <a href="https://github.com/Anthodev/pi-tools-style/actions/workflows/ci.yml?query=branch%3Adevelop"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/Anthodev/pi-tools-style/ci.yml?branch=develop&amp;style=for-the-badge&amp;label=tests&amp;labelColor=101418"></a>
+  <a href="https://github.com/Anthodev/pi-tools-style/releases/latest"><img alt="Latest stable release" src="https://img.shields.io/github/v/release/Anthodev/pi-tools-style?style=for-the-badge&amp;label=release&amp;labelColor=101418&amp;color=9ccbfb"></a>
+  <a href="https://github.com/Anthodev/pi-tools-style/blob/develop/LICENSE"><img alt="MIT License" src="https://img.shields.io/github/license/Anthodev/pi-tools-style?style=for-the-badge&amp;labelColor=101418&amp;color=b9c8da"></a>
+</p>
+
 `pi-tools-style` adds rounded frames, tool-specific icons, and live running indicators to Pi tool calls and direct shell commands. It decorates the output Pi already produces instead of replacing tool definitions or renderers.
 
 Built-in tools, MCP integrations, AFT, and third-party extensions keep control of their schemas, permissions, prompts, execution backends, and rendered content. When an output cannot be framed safely, the extension leaves it untouched.
@@ -16,6 +22,26 @@ Built-in tools, MCP integrations, AFT, and third-party extensions keep control o
 - **Renderer-friendly composition** — preserves Pi, AFT, MCP, and extension-provided output inside the frame.
 - **Image-safe fallback** — skips Kitty, iTerm2, and Sixel rows instead of corrupting terminal image sequences.
 - **Reload-safe state** — keeps wrappers and runtime configuration idempotent across `/reload`.
+
+## Installation
+
+The current release targets Pi `0.84.x` and requires Node.js 22 or newer.2
+
+To install it, use the following command:
+
+```bash
+pi install npm:@anthodev/pi-tools-style
+```
+
+To install this checkout as a local Pi package:
+
+```bash
+cd /absolute/path/to/pi-tools-style
+npm install --legacy-peer-deps
+pi install "$(pwd)"
+```
+
+Pi stores the package in user settings and references the directory directly, so local changes become available after `/reload` or a restart.
 
 ## What it looks like
 
@@ -44,38 +70,6 @@ Once execution finishes, the spinner disappears and the title remains stable:
 ```
 
 Direct `!` and `!!` commands use the same frame with a `shell` title. Slash-command output remains unchanged because Pi does not expose one uniform transcript component for slash commands.
-
-## Installation
-
-The current release targets Pi `0.84.x` and requires Node.js 22 or newer.
-
-To install this checkout as a local Pi package:
-
-```bash
-cd /absolute/path/to/pi-tools-style
-npm install --legacy-peer-deps
-pi install "$(pwd)"
-```
-
-Pi stores the package in user settings and references the directory directly, so local changes become available after `/reload` or a restart.
-
-To install it only for the current project, run this from that project:
-
-```bash
-pi install -l /absolute/path/to/pi-tools-style
-```
-
-To try the extension without installing it:
-
-```bash
-pi -e /absolute/path/to/pi-tools-style/index.ts
-```
-
-Once the package is published to npm, it can also be installed with:
-
-```bash
-pi install npm:@anthodev/pi-tools-style
-```
 
 ## Usage
 
