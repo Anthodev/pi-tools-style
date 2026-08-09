@@ -34,6 +34,23 @@ interface StoredConfig extends Omit<RenderDecoratorConfig, "enabled"> {
 	enabled: boolean;
 }
 
+interface ResolvedFrameOptions {
+	options: FrameOptions;
+	styleSignature: string | undefined;
+	title: string | undefined;
+}
+
+interface RenderCacheEntry {
+	config: StoredConfig;
+	output: string[];
+	rendered: readonly string[];
+	styleSignature: string | undefined;
+	title: string | undefined;
+	width: number;
+}
+
+const BORDER_STYLE_PROBE = "╭─╮│╰─╯";
+
 export function installRenderDecorator<T extends Renderable>(
 	component: RenderableConstructor<T>,
 	config: RenderDecoratorConfig<T>,
@@ -96,6 +113,8 @@ function createDecoratedRenderer(
 	key: symbol,
 	renderOriginal: RenderFunction,
 ): RenderFunction {
+	const cache = new WeakMap<Renderable, RenderCacheEntry>();
+
 	return function decoratedRender(width: number): string[] {
 		const current = readConfig(key);
 		if (!current?.enabled) return renderOriginal.call(this, width);
@@ -109,22 +128,38 @@ function createDecoratedRenderer(
 		}
 
 		try {
-			return decorateLines(this, rendered, width, current);
+			const resolved = resolveFrameOptions(this, current);
+			const cached = cache.get(this);
+			if (
+				cached?.config === current &&
+				cached.width === width &&
+				cached.title === resolved.title &&
+				cached.styleSignature === resolved.styleSignature &&
+				linesEqual(cached.rendered, rendered)
+			) {
+				return cached.output;
+			}
+
+			const output = decorateLines(rendered, width, current, resolved.options);
+			cache.set(this, {
+				config: current,
+				output,
+				rendered: [...rendered],
+				styleSignature: resolved.styleSignature,
+				title: resolved.title,
+				width,
+			});
+			return output;
 		} catch {
 			return renderOriginal.call(this, width);
 		}
 	};
 }
 
-function decorateLines(
+function resolveFrameOptions(
 	instance: Renderable,
-	rendered: readonly string[],
-	width: number,
 	config: StoredConfig,
-): string[] {
-	const lines = config.trimOuterRules
-		? trimOuterRules(rendered)
-		: [...rendered];
+): ResolvedFrameOptions {
 	const title = config.title?.(instance);
 	const options: FrameOptions = {};
 
@@ -137,7 +172,32 @@ function decorateLines(
 	}
 	if (title) options.title = title;
 
+	return {
+		options,
+		// Theme providers can change border output without changing component content.
+		styleSignature: styleBorder?.(BORDER_STYLE_PROBE),
+		title,
+	};
+}
+
+function decorateLines(
+	rendered: readonly string[],
+	width: number,
+	config: StoredConfig,
+	options: FrameOptions,
+): string[] {
+	const lines = config.trimOuterRules
+		? trimOuterRules(rendered)
+		: [...rendered];
+
 	return frameLines(lines, width, options);
+}
+
+function linesEqual(left: readonly string[], right: readonly string[]): boolean {
+	return (
+		left.length === right.length &&
+		left.every((line, index) => line === right[index])
+	);
 }
 
 function storeConfig<T extends Renderable>(

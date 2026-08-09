@@ -153,4 +153,71 @@ describe("installRenderDecorator", () => {
 		expect(status).toBe("unsupported");
 		expect(isRenderDecoratorEnabled(key)).toBe(false);
 	});
+
+	it("reuses framed output while rendered content and chrome stay unchanged", () => {
+		class Example {
+			render(_width: number): string[] {
+				return ["content"];
+			}
+		}
+		const instance = new Example();
+
+		installRenderDecorator(Example, {
+			key: Symbol("cached-frame"),
+			styleBorder: identity,
+			title: () => "read",
+		});
+		const first = instance.render(20);
+		const second = instance.render(20);
+
+		expect(second).toBe(first);
+	});
+
+	it("invalidates cached output when rendered content changes", () => {
+		let content = "first";
+		class Example {
+			render(_width: number): string[] {
+				return [content];
+			}
+		}
+		const instance = new Example();
+
+		installRenderDecorator(Example, {
+			key: Symbol("content-cache"),
+			styleBorder: identity,
+		});
+		const first = instance.render(20);
+		content = "second";
+		const second = instance.render(20);
+
+		expect(second).not.toBe(first);
+		expect(second.join("\n")).toContain("second");
+	});
+
+	it("invalidates cached output when title or border styling changes", () => {
+		let title = "first";
+		let borderPrefix = "old";
+		class Example {
+			render(_width: number): string[] {
+				return ["content"];
+			}
+		}
+		const instance = new Example();
+
+		installRenderDecorator(Example, {
+			key: Symbol("chrome-cache"),
+			styleBorder: (value) => `${borderPrefix}:${value}`,
+			title: () => title,
+		});
+		const first = instance.render(20);
+		title = "second";
+		const second = instance.render(20);
+		borderPrefix = "new";
+		const third = instance.render(20);
+
+		expect(second).not.toBe(first);
+		expect(second.join("\n")).toContain("second");
+		expect(third).not.toBe(second);
+		expect(third[0]).toContain("new:");
+	});
 });
