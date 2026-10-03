@@ -1,124 +1,77 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { clearToolSpinners, getToolSpinnerFrame, setToolSpinnerActive, toolSpinnerFrame, type ToolSpinnerTarget } from "../src/tool-spinner.ts";
 
-import {
-  clearToolSpinners,
-  toolSpinnerFrame,
-} from "../src/tool-spinner.ts";
-
-interface FakeToolComponent {
-  executionStarted: boolean;
-  isPartial: boolean;
-  ui: { requestRender: ReturnType<typeof vi.fn> };
+function target(): ToolSpinnerTarget {
+	return { state: {}, invalidate: vi.fn() };
 }
+beforeEach(() => { vi.useFakeTimers(); clearToolSpinners(); });
+afterEach(() => { clearToolSpinners(); vi.useRealTimers(); });
 
-function createComponent(): FakeToolComponent {
-  return {
-    executionStarted: false,
-    isPartial: true,
-    ui: { requestRender: vi.fn() },
-  };
-}
+describe("shared public-context animation", () => {
+	it("reads a static glyph without starting a timer for replay or export", () => {
+		const state = {};
+		expect(getToolSpinnerFrame("ascii")).toBe("|");
+		expect(toolSpinnerFrame(state, "nerd-font")).toBe("⠋");
+		vi.advanceTimersByTime(800);
+		expect(vi.getTimerCount()).toBe(0);
+		expect(toolSpinnerFrame(state, "nerd-font")).toBe("⠋");
+	});
 
-beforeEach(() => {
-  vi.useFakeTimers();
-  clearToolSpinners();
-});
+	it("uses explicit native-shell phase without registering a row or advancing replay/export", () => {
+		const replay = {};
+		expect(getToolSpinnerFrame("ascii", 0)).toBe("|");
+		expect(getToolSpinnerFrame("ascii", 1)).toBe("/");
+		expect(getToolSpinnerFrame("nerd-font", 0)).toBe("⠋");
+		expect(getToolSpinnerFrame("nerd-font", 1)).toBe("⠙");
+		vi.advanceTimersByTime(80);
+		expect(getToolSpinnerFrame("ascii")).toBe("|");
+		expect(toolSpinnerFrame(replay, "nerd-font")).toBe("⠋");
+		expect(vi.getTimerCount()).toBe(0);
+	});
 
-afterEach(() => {
-  clearToolSpinners();
-  vi.useRealTimers();
-});
+	for (const mode of ["ascii", "off", "nerd-font"] as const) {
+		it(`advances ${mode} glyphs every 80ms through public invalidation`, () => {
+			const current = target();
+			setToolSpinnerActive(current, true);
+			expect(toolSpinnerFrame(current.state, mode)).toBe(mode === "nerd-font" ? "⠋" : "|");
+			vi.advanceTimersByTime(80);
+			expect(current.invalidate).toHaveBeenCalledOnce();
+			expect(toolSpinnerFrame(current.state, mode)).toBe(mode === "nerd-font" ? "⠙" : "/");
+		});
+	}
 
-describe("toolSpinnerFrame", () => {
-  it("stays hidden before execution starts", () => {
-    const component = createComponent();
+	it("uses one ticker for multiple live rows and does not animate an unrelated state", () => {
+		const first = target(); const second = target();
+		setToolSpinnerActive(first, true); setToolSpinnerActive(second, true); setToolSpinnerActive(first, true);
+		expect(vi.getTimerCount()).toBe(1);
+		vi.advanceTimersByTime(80);
+		expect(first.invalidate).toHaveBeenCalledOnce(); expect(second.invalidate).toHaveBeenCalledOnce();
+		expect(toolSpinnerFrame({}, "ascii")).toBe("|");
+	});
 
-    expect(toolSpinnerFrame(component, "ascii")).toBeUndefined();
-    vi.advanceTimersByTime(300);
+	it("stops immediately when the last row completes or is disabled", () => {
+		const current = target(); setToolSpinnerActive(current, true);
+		vi.advanceTimersByTime(80); vi.mocked(current.invalidate).mockClear();
+		setToolSpinnerActive(current, false);
+		expect(vi.getTimerCount()).toBe(0);
+		vi.advanceTimersByTime(800);
+		expect(current.invalidate).not.toHaveBeenCalled();
+		expect(getToolSpinnerFrame("ascii")).toBe("|");
+	});
 
-    expect(component.ui.requestRender).not.toHaveBeenCalled();
-  });
+	it("clears all references and cadence on session shutdown", () => {
+		const current = target(); setToolSpinnerActive(current, true);
+		clearToolSpinners(); vi.advanceTimersByTime(800);
+		expect(vi.getTimerCount()).toBe(0);
+		expect(current.invalidate).not.toHaveBeenCalled();
+		expect(toolSpinnerFrame(current.state, "ascii")).toBe("|");
+	});
 
-  it("animates ASCII frames while execution is partial", () => {
-    const component = createComponent();
-    component.executionStarted = true;
-
-    expect(toolSpinnerFrame(component, "ascii")).toBe("|");
-    vi.advanceTimersByTime(100);
-
-    expect(component.ui.requestRender).toHaveBeenCalledTimes(1);
-    expect(toolSpinnerFrame(component, "ascii")).toBe("/");
-  });
-
-  it("keeps the ASCII spinner when icons are off", () => {
-    const component = createComponent();
-    component.executionStarted = true;
-
-    expect(toolSpinnerFrame(component, "off")).toBe("|");
-    vi.advanceTimersByTime(100);
-
-    expect(component.ui.requestRender).toHaveBeenCalledTimes(1);
-    expect(toolSpinnerFrame(component, "off")).toBe("/");
-  });
-
-  it("animates Braille frames in Nerd Font mode", () => {
-    const component = createComponent();
-    component.executionStarted = true;
-
-    expect(toolSpinnerFrame(component, "nerd-font")).toBe("⠋");
-    vi.advanceTimersByTime(100);
-
-    expect(toolSpinnerFrame(component, "nerd-font")).toBe("⠙");
-  });
-
-  it("stops animating after the final result", () => {
-    const component = createComponent();
-    component.executionStarted = true;
-    toolSpinnerFrame(component, "ascii");
-    vi.advanceTimersByTime(100);
-    component.ui.requestRender.mockClear();
-
-    component.isPartial = false;
-    vi.advanceTimersByTime(100);
-
-    expect(component.ui.requestRender).not.toHaveBeenCalled();
-    expect(toolSpinnerFrame(component, "ascii")).toBeUndefined();
-    vi.advanceTimersByTime(300);
-    expect(component.ui.requestRender).not.toHaveBeenCalled();
-  });
-
-  it("cleans up all animation on session shutdown", () => {
-    const component = createComponent();
-    component.executionStarted = true;
-    toolSpinnerFrame(component, "ascii");
-
-    clearToolSpinners();
-    vi.advanceTimersByTime(300);
-
-    expect(component.ui.requestRender).not.toHaveBeenCalled();
-  });
-
-  it("drops active components that disappear from the transcript", () => {
-    const component = createComponent();
-    component.executionStarted = true;
-    toolSpinnerFrame(component, "ascii");
-
-    vi.advanceTimersByTime(2_100);
-    const renderCount = component.ui.requestRender.mock.calls.length;
-    vi.advanceTimersByTime(500);
-
-    expect(renderCount).toBeGreaterThan(0);
-    expect(component.ui.requestRender).toHaveBeenCalledTimes(renderCount);
-  });
-
-  it("fails open when Pi render invalidation throws", () => {
-    const component = createComponent();
-    component.executionStarted = true;
-    component.ui.requestRender.mockImplementation(() => {
-      throw new Error("render unavailable");
-    });
-    toolSpinnerFrame(component, "ascii");
-
-    expect(() => vi.advanceTimersByTime(100)).not.toThrow();
-  });
+	it("drops a target whose public invalidation throws, without affecting another live row", () => {
+		const broken = { state: {}, invalidate: vi.fn(() => { throw Error("closed session"); }) };
+		const live = target(); setToolSpinnerActive(broken, true); setToolSpinnerActive(live, true);
+		expect(() => vi.advanceTimersByTime(80)).not.toThrow();
+		vi.advanceTimersByTime(80);
+		expect(broken.invalidate).toHaveBeenCalledOnce(); expect(live.invalidate).toHaveBeenCalledTimes(2);
+	});
 });

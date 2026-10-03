@@ -1,11 +1,9 @@
-import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences } from "@earendil-works/pi-tui";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
 	classifyTool,
-	createCategoryBorderStyle,
-	createToolBorderStyle,
+	getToolTheme,
 	setThemeProvider,
 } from "../src/tool-category.ts";
 
@@ -36,41 +34,26 @@ describe("classifyTool", () => {
 	});
 });
 
-describe("category border styles", () => {
-	it("maps categories to semantic colors from the current Pi theme", () => {
-		const fg = vi.fn(
-			(color: ThemeColor, value: string) => `[${color}]${value}`,
-		);
-		setThemeProvider(() => ({ fg }) as unknown as Theme);
-
-		expect(createToolBorderStyle("read")("│")).toBe("[mdLink]│");
-		expect(createToolBorderStyle("write")("│")).toBe("[warning]│");
-		expect(createToolBorderStyle("bash")("│")).toBe("[bashMode]│");
-		expect(createToolBorderStyle("web_search")("│")).toBe("[syntaxType]│");
-		expect(createToolBorderStyle("workflow")("│")).toBe(
-			"[customMessageLabel]│",
-		);
-		expect(createToolBorderStyle("ask_user")("│")).toBe("[accent]│");
+describe("current theme provider", () => {
+	it("reads the current public session theme without retaining its first value", () => {
+		const first = { fg: vi.fn() } as unknown as Theme;
+		const second = { fg: vi.fn() } as unknown as Theme;
+		let current = first;
+		setThemeProvider(() => current);
+		expect(getToolTheme()).toBe(first);
+		current = second;
+		expect(getToolTheme()).toBe(second);
 	});
 
-	it("reads the theme provider again for each render", () => {
-		let prefix = "first";
-		setThemeProvider(
-			() =>
-				({
-					fg: (_color: ThemeColor, value: string) => `${prefix}:${value}`,
-				}) as unknown as Theme,
-		);
-
-		expect(createToolBorderStyle("read")("─")).toBe("first:─");
-		prefix = "second";
-		expect(createToolBorderStyle("read")("─")).toBe("second:─");
+	it("returns no theme before startup and after provider release", () => {
+		expect(getToolTheme()).toBeUndefined();
+		setThemeProvider(() => ({ fg: vi.fn() }) as unknown as Theme);
+		setThemeProvider(undefined);
+		expect(getToolTheme()).toBeUndefined();
 	});
 
-	it("uses a dim theme-neutral fallback before session startup", () => {
-		const styled = createCategoryBorderStyle("other")("│");
-
-		expect(stripTerminalSequences(styled)).toBe("│");
-		expect(styled).toContain("\u001b[2m");
+	it("fails open when a theme provider throws", () => {
+		setThemeProvider(() => { throw new Error("theme unavailable"); });
+		expect(getToolTheme()).toBeUndefined();
 	});
 });

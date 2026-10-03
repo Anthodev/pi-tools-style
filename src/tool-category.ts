@@ -1,4 +1,4 @@
-import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 
 export type ToolCategory =
 	| "execute"
@@ -9,22 +9,9 @@ export type ToolCategory =
 	| "orchestrate"
 	| "other";
 
-export type BorderStyle = (value: string) => string;
 type ThemeProvider = () => Theme;
 
 const THEME_PROVIDER_KEY = Symbol.for("pi-tools-style:theme-provider");
-const DIM = "\u001b[2m";
-const RESET_DIM = "\u001b[22m";
-
-const CATEGORY_THEME_COLOR: Record<ToolCategory, ThemeColor> = {
-	execute: "bashMode",
-	external: "syntaxType",
-	inspect: "mdLink",
-	interact: "accent",
-	mutate: "warning",
-	orchestrate: "customMessageLabel",
-	other: "borderMuted",
-};
 
 const EXTERNAL_NAMESPACES = new Set([
 	"api",
@@ -117,18 +104,6 @@ export function classifyTool(toolName: string): ToolCategory {
 	return "other";
 }
 
-export function createToolBorderStyle(toolName: string): BorderStyle {
-	return createCategoryBorderStyle(classifyTool(toolName));
-}
-
-export function createCategoryBorderStyle(category: ToolCategory): BorderStyle {
-	const theme = readTheme();
-	if (!theme) return dimBorder;
-
-	const color = CATEGORY_THEME_COLOR[category];
-	return (value) => theme.fg(color, value);
-}
-
 export function setThemeProvider(provider: ThemeProvider | undefined): void {
 	if (provider) {
 		Reflect.set(globalThis, THEME_PROVIDER_KEY, provider);
@@ -137,7 +112,8 @@ export function setThemeProvider(provider: ThemeProvider | undefined): void {
 	Reflect.deleteProperty(globalThis, THEME_PROVIDER_KEY);
 }
 
-function readTheme(): Theme | undefined {
+/** Current public session theme; shell falls back to native until a provider is bound. */
+export function getToolTheme(): Theme | undefined {
 	const provider = Reflect.get(globalThis, THEME_PROVIDER_KEY) as
 		| ThemeProvider
 		| undefined;
@@ -158,6 +134,3 @@ function normalizeToolName(toolName: string): string {
 		.toLowerCase();
 }
 
-function dimBorder(value: string): string {
-	return `${DIM}${value}${RESET_DIM}`;
-}

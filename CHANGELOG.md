@@ -6,6 +6,7 @@
 
 ### Changes
 
+- chore(release): prepare v0.1.4 ([e9a6606](https://github.com/Anthodev/pi-tools-style/commit/e9a6606f1995b038e5f08fab03542c0131f40bf4))
 - ci(release): use curated changelog notes for tagged releases ([fdcb72e](https://github.com/Anthodev/pi-tools-style/commit/fdcb72e8b6473d23a4c2ad8630280e140f4fb33b))
 
 ### Fixes
