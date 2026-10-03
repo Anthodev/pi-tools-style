@@ -25,7 +25,7 @@ Built-in tools, MCP integrations, AFT, and third-party extensions keep control o
 
 ## Installation
 
-The current release targets Pi `0.84.x` and requires Node.js 22 or newer.2
+This checkout targets Pi `1.0.x`, verified with `1.0.0`, and requires Node.js `>=22.19.0`.
 
 To install it, use the following command:
 
@@ -135,7 +135,7 @@ Borders resolve their color from the active Pi theme on every render. Switching 
 
 ## How it works
 
-Pi `0.84.x` does not expose public render middleware around `ToolExecutionComponent` and `BashExecutionComponent`. `pi-tools-style` therefore installs a narrow wrapper around their existing `render()` methods.
+Pi `1.0.x` does not expose public, composable render middleware covering both tools and direct shell commands. `pi-tools-style` therefore installs a narrow wrapper around the existing `render()` methods of `ToolExecutionComponent` and `BashExecutionComponent`.
 
 The wrapper asks the previous renderer to draw at the frame's inner width, removes only paired outer horizontal rules, and then adds ANSI-aware chrome. It does not call `pi.registerTool()`, replace tool definitions, or intercept execution.
 
@@ -143,12 +143,13 @@ Configuration and animation state live behind `Symbol.for()` keys. Reloading upd
 
 ## Compatibility and limits
 
-- Pi `0.84.x` is the supported target. Private TUI internals may change in later releases.
+- Pi `1.0.x` is the supported target, verified with `1.0.0` in both `fullscreen` and `regular` TUI modes. Pi `0.84.x` is no longer a supported target. Private TUI internals may change in later releases.
 - The render wrapper is necessarily unsupported until Pi exposes public, composable render middleware.
 - Kitty, iTerm2, and Sixel image output remains unboxed by design.
 - Slash commands remain outside the current scope because their transcript output has no uniform component.
 - Another extension can replace this wrapper if it overwrites component rendering without composing with the previous renderer.
 - Unsupported renderer shapes fail open rather than affecting tool execution.
+- Frame characters remain selectable text and are included in copied output. Excluding decorative cells would require Pi/TUI integration for fullscreen selection; no portable exclusion path has been identified for native terminal selection in regular mode.
 
 ## Development
 
@@ -160,7 +161,7 @@ npm run check
 npm pack --dry-run --json
 ```
 
-`npm run check` runs TypeScript validation and the Vitest suite. Tests cover frame width, ANSI output, terminal images, native and AFT rule removal, category colors, icon modes, persisted settings, spinner lifecycle, real `ToolExecutionComponent` integration, render composition, reload idempotence, fail-open behavior, and the no-`registerTool()` contract.
+`npm run check` runs TypeScript validation and the Vitest suite. Tests cover frame width, ANSI output, terminal images, native and AFT rule removal, category colors, icon modes, persisted settings, spinner lifecycle, real `ToolExecutionComponent` and `BashExecutionComponent` integration, third-party renderer composition, decorator toggling and reinstallation, reload idempotence, fail-open behavior, and the no-`registerTool()` contract.
 
 `--legacy-peer-deps` avoids an npm 10.9.8 Arborist failure observed while resolving the development peer dependency graph.
 

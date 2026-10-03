@@ -40,12 +40,12 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.x",
-    "@earendil-works/pi-tui": "0.84.x"
+    "@earendil-works/pi-coding-agent": "1.0.x",
+    "@earendil-works/pi-tui": "1.0.x"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.1",
-    "@earendil-works/pi-tui": "0.84.1",
+    "@earendil-works/pi-coding-agent": "1.0.0",
+    "@earendil-works/pi-tui": "1.0.0",
     "@types/node": "24.12.0",
     "typescript": "5.9.3",
     "vitest": "4.1.9"
