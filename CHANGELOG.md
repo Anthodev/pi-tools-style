@@ -1,12 +1,18 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
-
 ## [Unreleased]
 
-### Compatibility
+## [0.1.4] - 2026-10-03
+
+### Changes
+
+- ci(release): use curated changelog notes for tagged releases ([fdcb72e](https://github.com/Anthodev/pi-tools-style/commit/fdcb72e8b6473d23a4c2ad8630280e140f4fb33b))
+
+### Fixes
 
 - fix(compat): support Pi 1.0.x ([9c985dc](https://github.com/Anthodev/pi-tools-style/commit/9c985dc4055928aa3175a478f9002638841a4eb4))
+
+**Full changelog**: https://github.com/Anthodev/pi-tools-style/compare/v0.1.3...v0.1.4
 
 ## [0.1.3] - 2026-08-09
 
