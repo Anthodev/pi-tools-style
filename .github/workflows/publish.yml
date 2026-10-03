@@ -10,12 +10,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: npm-release-${{ github.ref }}
+  group: npm-release
   cancel-in-progress: false
 
 jobs:
   test:
-    name: Test tagged commit on Node.js ${{ matrix.node-version }}
+    name: Validate
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
@@ -54,14 +54,28 @@ jobs:
           node-version: ${{ matrix.node-version }}
           package-manager-cache: false
 
+      - name: Validate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="$(mktemp)"
+          node scripts/generate-release-notes.ts "$GITHUB_REF_NAME" "$GITHUB_SHA" "$notes"
+          test -s "$notes"
+
       - name: Install dependencies
         run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
 
       - name: Run checks
-        run: npm run check
+        shell: bash
+        env:
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-agent-dir
+        run: |
+          set -euo pipefail
+          mkdir -p "$PI_CODING_AGENT_DIR"
+          npm run check
 
   publication-checks:
-    name: Check package publication
+    name: Package
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -154,17 +168,22 @@ jobs:
           set -euo pipefail
           sha256="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
           test -n "$sha256"
+          printf '%s  %s\n' "$sha256" "$(basename "$TARBALL")" > SHA256SUMS
+          cat SHA256SUMS
           echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
       - name: Upload publication tarball
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: npm-package
-          path: ${{ steps.pack.outputs.tarball }}
+          path: |
+            ${{ steps.pack.outputs.tarball }}
+            SHA256SUMS
           if-no-files-found: error
           retention-days: 1
 
   publish:
-    name: Publish package
+    name: Publish npm package
     needs: publication-checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -194,7 +213,11 @@ jobs:
           set -euo pipefail
           mapfile -t tarballs < <(find package -maxdepth 1 -type f -name '*.tgz' -print)
           test "${#tarballs[@]}" -eq 1
+          test -f package/SHA256SUMS
+          test "$(cut -d' ' -f1 package/SHA256SUMS)" = "$EXPECTED_SHA256"
           echo "$EXPECTED_SHA256  ${tarballs[0]}" | sha256sum --check --strict -
+          (cd package && sha256sum --check --strict SHA256SUMS)
+
       - name: Publish package
         shell: bash
         run: |
@@ -205,7 +228,9 @@ jobs:
 
   release:
     name: Create GitHub release
-    needs: publish
+    needs:
+      - publish
+      - publication-checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -218,60 +243,40 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Generate release notes
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.x
+          package-manager-cache: false
+
+      - name: Download publication tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-package
+          path: package
+
+      - name: Verify publication tarball integrity
         shell: bash
+        env:
+          EXPECTED_SHA256: ${{ needs.publication-checks.outputs.tarball-sha256 }}
         run: |
           set -euo pipefail
-          previous_tag="$(git describe --tags --match 'v[0-9]*' --abbrev=0 "$GITHUB_SHA^" 2>/dev/null || true)"
+          mapfile -t tarballs < <(find package -maxdepth 1 -type f -name '*.tgz' -print)
+          test "${#tarballs[@]}" -eq 1
+          test -f package/SHA256SUMS
+          test "$(cut -d' ' -f1 package/SHA256SUMS)" = "$EXPECTED_SHA256"
+          echo "$EXPECTED_SHA256  ${tarballs[0]}" | sha256sum --check --strict -
+          (cd package && sha256sum --check --strict SHA256SUMS)
 
-          if [[ -n "$previous_tag" ]]; then
-            range="$previous_tag..$GITHUB_SHA"
-            changelog_url="https://github.com/$GITHUB_REPOSITORY/compare/$previous_tag...$GITHUB_REF_NAME"
-          else
-            range="$GITHUB_SHA"
-            changelog_url="https://github.com/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME"
-          fi
-
-          RANGE="$range" CHANGELOG_URL="$changelog_url" node --input-type=module <<'EOF'
-          import { execFileSync } from "node:child_process";
-          import { writeFileSync } from "node:fs";
-
-          const groups = [
-            { key: "feat", title: "Features", commits: [] },
-            { key: "change", title: "Changes", commits: [] },
-            { key: "fix", title: "Fixes", commits: [] },
-            { key: "ci", title: "CI", commits: [] },
-          ];
-          const byKey = new Map(groups.map((group) => [group.key, group]));
-          const fields = execFileSync(
-            "git",
-            ["log", "--first-parent", "-z", "--format=%s%x00%h", process.env.RANGE],
-            { encoding: "utf8" },
-          ).split("\0").filter(Boolean);
-
-          for (let index = 0; index < fields.length; index += 2) {
-            const subject = fields[index].trim();
-            const hash = fields[index + 1].trim();
-            const type = subject.match(/^([a-z]+)(?:\([^)]*\))?!?:\s+/i)?.[1].toLowerCase();
-            const key = type === "feat"
-              ? "feat"
-              : type === "fix"
-                ? "fix"
-                : type === "ci"
-                  ? "ci"
-                  : "change";
-
-            byKey.get(key).commits.push(`- ${subject} (\`${hash}\`)`);
-          }
-
-          const notes = [];
-          for (const group of groups) {
-            if (group.commits.length === 0) continue;
-            notes.push(`## ${group.title}`, "", ...group.commits, "");
-          }
-          notes.push(`**Full changelog**: ${process.env.CHANGELOG_URL}`, "");
-          writeFileSync("release-notes.md", notes.join("\n"));
-          EOF
+      - name: Generate release notes
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          node scripts/generate-release-notes.ts "$RELEASE_TAG" "$RELEASE_SHA" release-notes.md
+          test -s release-notes.md
 
       - name: Create GitHub release
         env:
@@ -279,13 +284,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          options=()
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
-            options+=(--prerelease)
-          fi
-
+          mapfile -t tarballs < <(find package -maxdepth 1 -type f -name '*.tgz' -print)
+          test "${#tarballs[@]}" -eq 1
           gh release create "$GITHUB_REF_NAME" \
-            "${options[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --notes-file release-notes.md \
-            --verify-tag
+            --verify-tag \
+            "${tarballs[0]}" package/SHA256SUMS

@@ -163,7 +163,33 @@ npm pack --dry-run --json
 
 `npm run check` runs TypeScript validation and the Vitest suite. Tests cover frame width, ANSI output, terminal images, native and AFT rule removal, category colors, icon modes, persisted settings, spinner lifecycle, real `ToolExecutionComponent` and `BashExecutionComponent` integration, third-party renderer composition, decorator toggling and reinstallation, reload idempotence, fail-open behavior, and the no-`registerTool()` contract.
 
+Release-note tests cover exact version sections, Markdown fences and whitespace, duplicate or missing sections, tagged Git snapshots, annotated and lightweight tags, and CLI failure paths.
+
 `--legacy-peer-deps` avoids an npm 10.9.8 Arborist failure observed while resolving the development peer dependency graph.
+
+## Releases
+
+Releases are triggered only by stable `vX.Y.Z` tag pushes. `.github/workflows/publish.yml` validates the tagged commit on Node.js `22.19.0` and `24.x`, packages one npm tarball, publishes it to npm, then creates the GitHub release with that tarball and `SHA256SUMS` as assets.
+
+`CHANGELOG.md` is the source of release notes. CI extracts the exact version section from the tagged commit, not the working tree, and preserves its summary, lists, links, and Markdown. Invalid tags, mismatched revisions, or missing, empty, or duplicate sections fail before publication. CI neither generates notes from commit subjects nor edits the changelog.
+
+To prepare a release:
+
+1. Update `package.json` and regenerate `package-lock.json`. Move the release entries from `Unreleased` into a dated `## [X.Y.Z] - YYYY-MM-DD` section, preserving verified commit or PR references and the full changelog comparison link.
+2. Run `PI_CODING_AGENT_DIR="$(mktemp -d)" npm run check` and `npm run pack:check`.
+3. Seal and push the release-preparation commit on `develop`. With jj, use the sealed commit's explicit SHA, never an empty working-copy `@`.
+4. Set `VERSION` to the prepared package version and `RELEASE_SHA` to that commit's full SHA, then validate the notes before pushing the tag:
+
+```bash
+jj tag set "v${VERSION}" -r "$RELEASE_SHA"
+notes="$(mktemp)"
+node scripts/generate-release-notes.ts "v${VERSION}" "$RELEASE_SHA" "$notes"
+jj git push --tag "v${VERSION}"
+```
+
+The workflow requires the tag to match the package and lockfile versions and to belong to `develop`. npm publication uses OIDC Trusted Publishing on a GitHub-hosted runner with the protected `npm` environment. Keep the `publish.yml` filename and environment aligned with the trusted publisher configuration. Concurrent release tags are serialized.
+
+Publication is not an idempotent update. An already-published npm version or existing GitHub release makes a rerun fail. npm publication precedes GitHub release creation, so a failure in the latter can leave the package already published. Do not move a published tag or delete a release to make a rerun succeed.
 
 ## License
 

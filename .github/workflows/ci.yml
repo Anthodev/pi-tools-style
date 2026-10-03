@@ -41,4 +41,10 @@ jobs:
         run: npm ci --legacy-peer-deps --ignore-scripts --no-audit --no-fund
 
       - name: Run checks
-        run: npm run check
+        shell: bash
+        env:
+          PI_CODING_AGENT_DIR: ${{ runner.temp }}/pi-agent-dir
+        run: |
+          set -euo pipefail
+          mkdir -p "$PI_CODING_AGENT_DIR"
+          npm run check
