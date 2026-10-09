@@ -1,7 +1,7 @@
 import { keyHint, type ExtensionAPI, type Theme, type ToolInfo, type ToolRendererResolver, type ToolRenderers } from "@earendil-works/pi-coding-agent";
 import { Box, Container, MouseRegion, Text, getCapabilities, getImageDimensions, imageFallback, type Component, type TuiMouseEvent, type TuiMouseEventResult } from "@earendil-works/pi-tui";
-import { containsTerminalImage } from "./frame.js";
-import type { ToolContext, ToolResult, ToolSnapshot, ToolView, ToolViewFactory } from "./tool-presentation.js";
+import { containsTerminalImage, hasStableToolBody, isInteractiveToolComponent } from "./frame.js";
+import { isExecutionToolName, type ToolContext, type ToolResult, type ToolSnapshot, type ToolView, type ToolViewFactory } from "./tool-presentation.js";
 import { setToolSpinnerActive, type ToolSpinnerTarget } from "./tool-spinner.js";
 import { getIconMode, getSettings, isShellEnabledByConfig, isToolEnabledByConfig } from "./settings.js";
 import type { IconMode } from "./tool-icon.js";
@@ -191,6 +191,7 @@ function capturedInfo(info: ToolInfo | undefined): ToolInfo | undefined {
 	return info ? { ...info, sourceInfo: { ...info.sourceInfo }, ...(info.namespace ? { namespace: { ...info.namespace } } : {}) } : undefined;
 }
 function classify(name: string, info: ToolInfo | undefined): ToolSnapshot["presentation"] {
+	if (isExecutionToolName(name)) return "execution";
 	if (isWeb(name, info, undefined)) return "web";
 	if (isMcp(info)) return "mcp";
 	if (isBuiltin(name, info)) return "builtin";
@@ -405,7 +406,7 @@ class ToolPresentation {
 		if (this.canClaimAnimation) this.session.claimState(this.toolCallId, this.state);
 		this.refreshAnimation();
 		// A previously mounted native renderer must see completion even while hidden.
-		if (this.nativeActivated) this.ensureNativeCall();
+		if (this.nativeActivated) this.prepareNativeCall();
 	}
 	updateResult(result: ToolResult, options: ResultOptions, theme: Theme, context: ToolContext): void {
 		const previous = this.result;
@@ -429,7 +430,7 @@ class ToolPresentation {
 		this.observeExpansion();
 		if (this.canClaimAnimation) this.session.claimState(this.toolCallId, this.state);
 		this.refreshAnimation();
-		if (this.nativeActivated) this.ensureNativeResult();
+		if (this.nativeActivated) this.prepareNativeResult();
 	}
 	private sameEnvironment(theme: Theme): boolean {
 		const retained = this.retained;
@@ -527,34 +528,42 @@ class ToolPresentation {
 			},
 		};
 	}
-	private ensureNativeCall(): Component | undefined {
-		if (!this.callDirty) return this.callChild;
+	private prepareNativeCall(): void {
+		if (!this.callDirty) return;
 		this.callDirty = false;
 		const snapshot = this.call ?? { args: this.context.args, theme: this.theme, context: this.context };
 		const renderer = this.downstream?.renderCall;
 		if (renderer) {
 			try {
 				this.nativeCall = renderer(snapshot.args, snapshot.theme, this.nativeContext(snapshot.context, this.nativeCall));
-				this.callChild = this.nativeCall;
-				return this.callChild;
 			} catch { this.nativeCall = undefined; }
+		} else this.nativeCall = undefined;
+		this.callChild = this.nativeCall;
+	}
+	private ensureNativeCall(): Component | undefined {
+		this.prepareNativeCall();
+		if (!this.callChild) {
+			const snapshot = this.call ?? { args: this.context.args, theme: this.theme, context: this.context };
+			this.callChild = new Text(formatNativeCall(this.toolName, snapshot.args, snapshot.theme, snapshot.context.expanded), 0, 0);
 		}
-		this.callChild = new Text(formatNativeCall(this.toolName, snapshot.args, snapshot.theme, snapshot.context.expanded), 0, 0);
 		return this.callChild;
 	}
-	private ensureNativeResult(): Component | undefined {
-		if (!this.result || !this.resultDirty) return this.resultChild;
+	private prepareNativeResult(): void {
+		if (!this.result || !this.resultDirty) return;
 		this.resultDirty = false;
 		const snapshot = this.result;
 		const renderer = this.downstream?.renderResult;
 		if (renderer) {
 			try {
 				this.nativeResult = renderer(snapshot.result, snapshot.options, snapshot.theme, this.nativeContext(snapshot.context, this.nativeResult));
-				this.resultChild = this.nativeResult;
-				return this.resultChild;
 			} catch { this.nativeResult = undefined; }
-		}
-		this.resultChild = createNativeResultFallback(snapshot);
+		} else this.nativeResult = undefined;
+		this.resultChild = this.nativeResult;
+	}
+	private ensureNativeResult(): Component | undefined {
+		if (!this.result) return this.resultChild;
+		this.prepareNativeResult();
+		this.resultChild ??= createNativeResultFallback(this.result);
 		return this.resultChild;
 	}
 	private nativeChildren(): { call: Component | undefined; result: Component | undefined } {
@@ -598,17 +607,25 @@ class ToolPresentation {
 					const snapshot = this.snapshot();
 					let view = current.implementation.createToolView(this.toolName, snapshot, this.theme);
 					if (this.presentation === "generic") {
-						const children = this.nativeChildren();
+						this.nativeActivated = true;
+						this.prepareNativeCall();
+						this.prepareNativeResult();
 						view = { ...view, sections: [
-							...(children.call ? [{ component: children.call, slot: "call" as const }] : []),
-							...(children.result ? [{ component: children.result, slot: "result" as const }] : []),
+							...(this.nativeCall ? [{
+								component: this.nativeCall, slot: "call" as const, label: "Input",
+								previewPolicy: { edge: "head" as const, count: 10, unit: "visual-lines" as const },
+							}] : view.sections.filter((section) => section.slot === "call")),
+							...(this.nativeResult ? [{
+								component: this.nativeResult, slot: "result" as const, label: "Output",
+								previewPolicy: { edge: "head" as const, count: 5, unit: "visual-lines" as const },
+							}] : view.sections.filter((section) => section.slot === "result")),
 						] };
 					}
 					this.retained = {
 						view, snapshot, themeColors: this.theme.colors, colorMode: this.theme.getColorMode?.(),
 						appearance: this.theme.appearance, iconMode: getIconMode(),
-						headerOnly: this.presentation !== "generic" && !view.sections.some((section) =>
-							typeof section.component.handleMouse === "function" || typeof section.component.handleInput === "function"),
+						headerOnly: !view.sections.some((section) => isInteractiveToolComponent(section.component)
+							|| (this.presentation === "generic" && !hasStableToolBody(section.component))),
 					};
 				}
 				const { view, snapshot } = this.retained;

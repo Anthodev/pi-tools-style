@@ -35,6 +35,7 @@ import {
 	stripTerminalSequences,
 	type Component,
 } from "@earendil-works/pi-tui";
+import { getIconMode } from "./settings.js";
 
 export type ToolStatus = "pending" | "running" | "done" | "error" | "cancelled";
 
@@ -46,11 +47,18 @@ export interface ToolHead {
 	durationMs?: number;
 }
 
+export interface ToolPreview {
+	edge: "head" | "tail";
+	count: number;
+	unit: "visual-lines" | "entries";
+}
+
 export interface ToolSection {
 	label?: string;
 	component: Component;
 	slot: "call" | "result";
 	preview?: boolean;
+	previewPolicy?: ToolPreview;
 	/**
 	 * Set when the component's rows are already wrapped and padded for `render(width)`,
 	 * so layout can skip its defensive wrap. Owned SDK `Text`/`Markdown` sections set it;
@@ -63,7 +71,7 @@ export interface ToolView {
 	layout: "framed" | "inline";
 	head: ToolHead;
 	sections: readonly ToolSection[];
-	preview?: { edge: "head" | "tail"; count: number; unit: "visual-lines" | "entries" };
+	preview?: ToolPreview;
 	tone?: "warning" | "error";
 	expanded: boolean;
 }
@@ -76,10 +84,15 @@ export interface ToolSnapshot {
 	result?: ToolResult;
 	context: ToolContext;
 	toolInfo?: ToolInfo;
-	presentation: "builtin" | "mcp" | "mcp-unresolved" | "web" | "generic";
+	presentation: "builtin" | "mcp" | "mcp-unresolved" | "web" | "execution" | "generic";
 }
 
 export type ToolViewFactory = (toolName: string, snapshot: ToolSnapshot, theme: Theme) => ToolView;
+
+/** Execution ownership follows the exact requested name, independent of provenance. */
+export function isExecutionToolName(toolName: string): boolean {
+	return toolName === "codemode" || toolName.startsWith("ctx_execute");
+}
 
 /** Shown in place of a target whose value was streamed but is not the expected string. */
 const INVALID_ARG = "[invalid arg]";
@@ -96,7 +109,6 @@ const MCP_RESOURCE_TITLES: Record<string, string> = {
 	read_mcp_resource: "MCP Resource",
 };
 
-const COLLAPSED_ARGS_CHARS = 100;
 
 /* -------------------------------------------------------------------------- */
 /* Display-text normalization                                                 */
@@ -188,11 +200,6 @@ export function resolveDisplayPath(input: string, cwd: string): string {
 	return isAbsolute(normalized) ? nodeResolvePath(normalized) : nodeResolvePath(normalizedCwd, normalized);
 }
 
-function shortenPath(value: string): string {
-	const home = homedir();
-	return value.startsWith(home) ? `~${value.slice(home.length)}` : value;
-}
-
 /** Link a styled path to its resolved `file://` URL when the terminal supports links. */
 function linkPath(styledText: string, rawPath: string, cwd: string): string {
 	if (!rawPath) {
@@ -208,24 +215,6 @@ function linkPath(styledText: string, rawPath: string, cwd: string): string {
 	}
 }
 
-function renderPath(rawPath: ArgValue, theme: Theme, cwd: string): string {
-	if (rawPath === WRONG_TYPE) {
-		return INVALID_ARG;
-	}
-	if (rawPath === undefined || rawPath === "") {
-		return theme.fg("toolOutput", PENDING);
-	}
-	// Only the displayed text is sanitized; the link target keeps the original input.
-	return linkPath(theme.fg("accent", normalizeDisplayText(shortenPath(rawPath))), rawPath, cwd);
-}
-
-/**
- * Head target for a path argument: pending while it streams in, otherwise the
- * display path (never a fabricated link for a wrong-type value).
- */
-function pathTarget(rawPath: ArgValue, theme: Theme, cwd: string): string {
-	return rawPath === undefined ? PENDING : renderPath(rawPath, theme, cwd);
-}
 
 /* -------------------------------------------------------------------------- */
 /* Result text extraction                                                     */
@@ -367,6 +356,7 @@ interface SectionOptions {
 	label?: string;
 	slot?: "call" | "result";
 	preview?: boolean;
+	previewPolicy?: ToolPreview;
 }
 
 function section(lines: readonly string[], options: SectionOptions = {}): ToolSection | undefined {
@@ -382,11 +372,84 @@ function section(lines: readonly string[], options: SectionOptions = {}): ToolSe
 	if (options.label !== undefined) {
 		result.label = options.label;
 	}
+	if (options.previewPolicy !== undefined) {
+		result.previewPolicy = options.previewPolicy;
+	}
 	return result;
 }
 
 function sectionsOf(...candidates: readonly (ToolSection | undefined)[]): ToolSection[] {
 	return candidates.filter((candidate): candidate is ToolSection => candidate !== undefined);
+}
+
+const INPUT_PREVIEW: ToolPreview = { edge: "head", count: 10, unit: "visual-lines" };
+const OUTPUT_PREVIEW: ToolPreview = { edge: "head", count: 5, unit: "visual-lines" };
+const COMMAND_PREVIEW: ToolPreview = { edge: "head", count: 1, unit: "visual-lines" };
+const WRITE_PREVIEW: ToolPreview = { edge: "head", count: 8, unit: "visual-lines" };
+
+/** Explicit null/primitive arguments are delivered data, not a missing revision. */
+function suppliedArgs(snapshot: ToolSnapshot): unknown {
+	return snapshot.args === undefined ? snapshot.context.args : snapshot.args;
+}
+
+function argumentText(value: unknown, pretty = false): string {
+	return normalizeDisplayText(typeof value === "number" && !Number.isFinite(value) ? String(value) : jsonText(value, pretty && typeof value !== "string"));
+}
+
+function stringInput(value: unknown): string {
+	if (value === undefined) {
+		return PENDING;
+	}
+	if (typeof value !== "string") {
+		return `${INVALID_ARG} (${argumentText(value)})`;
+	}
+	const normalized = normalizeDisplayText(value);
+	return normalized.trim().length === 0 ? argumentText(value) : normalized;
+}
+
+function inputField(key: string, value: unknown, theme: Theme, cwd: string, required = false): string {
+	const label = normalizeDisplayText(key);
+	const pathText = key === "path" && typeof value === "string" ? normalizeDisplayText(value) : undefined;
+	if (pathText !== undefined && pathText.trim().length > 0) {
+		// Display the full caller text, while resolving only the hyperlink destination.
+		return `${label}: ${linkPath(theme.fg("accent", pathText), value as string, cwd)}`;
+	}
+	return `${label}: ${required || key === "path" || key === "pattern" || key === "glob" ? stringInput(value) : argumentText(value)}`;
+}
+
+/** Lightweight complete input beside an independently retained result primary. */
+function nativeInputSection(
+	snapshot: ToolSnapshot,
+	theme: Theme,
+	required: readonly string[],
+	excluded: readonly string[] = [],
+	preview = true,
+): ToolSection {
+	const value = suppliedArgs(snapshot);
+	const args = asRecord(value);
+	const lines: string[] = [];
+	if (args) {
+		for (const key of required) {
+			lines.push(inputField(key, args[key], theme, snapshot.context.cwd, true));
+		}
+		const entries = Object.entries(args);
+		for (const [key, entry] of entries) {
+			if (!required.includes(key) && !excluded.includes(key)) {
+				lines.push(inputField(key, entry, theme, snapshot.context.cwd));
+			}
+		}
+		if (entries.length === 0) {
+			lines.push("{}");
+		}
+	} else {
+		lines.push(value === undefined ? PENDING : argumentText(value, true));
+	}
+	return section(lines, { label: "Input", slot: "call", preview, previewPolicy: INPUT_PREVIEW })!;
+}
+
+function fullArgumentsSection(args: unknown): ToolSection {
+	const text = args === undefined ? PENDING : argumentText(args, true);
+	return section(text.split("\n"), { label: "Input", slot: "call", previewPolicy: INPUT_PREVIEW })!;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -483,13 +546,237 @@ export function invalidateToolViewCache(state: object): void {
 /* Generic                                                                    */
 /* -------------------------------------------------------------------------- */
 
-function genericView(toolName: string, snapshot: ToolSnapshot): ToolView {
+function genericView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolView {
+	const isError = snapshot.context.isError;
+	const output = extractToolText(snapshot.result, snapshot.context.showImages);
 	return {
 		layout: "framed",
 		head: makeHead(normalizeDisplayText(toolName), "", [], snapshot),
-		sections: [],
+		sections: sectionsOf(
+			fullArgumentsSection(suppliedArgs(snapshot)),
+			output.length > 0
+				? section(output.split("\n").map((line) => theme.fg(isError ? "error" : "toolOutput", line)), {
+					label: "Output", slot: "result", previewPolicy: OUTPUT_PREVIEW,
+				}) : undefined,
+		),
+		...(isError ? { tone: "error" } : {}),
 		expanded: snapshot.context.expanded,
 	};
+}
+
+/* -------------------------------------------------------------------------- */
+/* Context execution                                                          */
+/* -------------------------------------------------------------------------- */
+
+const EXECUTION_INPUT_PREVIEW: ToolPreview = { edge: "head", count: 10, unit: "visual-lines" };
+const EXECUTION_OUTPUT_PREVIEW: ToolPreview = { edge: "head", count: 5, unit: "visual-lines" };
+const EXECUTION_LANGUAGES: Readonly<Record<string, true | undefined>> = {
+	javascript: true, typescript: true, python: true, shell: true, ruby: true, go: true,
+	rust: true, php: true, perl: true, r: true, elixir: true, csharp: true,
+};
+
+function executionCodeSection(
+	code: ArgValue,
+	language: string | undefined,
+	state: object | undefined,
+	theme: Theme,
+	label?: string,
+): ToolSection {
+	const normalized = typeof code === "string" ? normalizeDisplayText(code) : undefined;
+	const literal = normalized !== undefined && normalized.trim().length === 0;
+	const text = code === undefined ? PENDING : code === WRONG_TYPE ? INVALID_ARG
+		: literal ? `code: ${normalizeDisplayText(jsonText(code, false))}` : normalized!;
+	const grammar = language !== undefined && Object.hasOwn(EXECUTION_LANGUAGES, language)
+		? language === "shell" ? "bash" : language : undefined;
+	return reuseToolSection(state, theme, "execution-code", [text, language, grammar, label, code === WRONG_TYPE, literal], () => {
+		const lines = typeof code === "string" && !literal && grammar !== undefined
+			? highlightCode(text, grammar) : text.split("\n");
+		return section(lines, {
+			slot: "call", previewPolicy: EXECUTION_INPUT_PREVIEW,
+			...(label === undefined ? {} : { label }),
+		});
+	})!;
+}
+
+function executionArgumentsSection(args: unknown, label?: string): ToolSection | undefined {
+	const text = args === undefined ? PENDING : normalizeDisplayText(jsonText(args, true));
+	return section(text.split("\n"), {
+		slot: "call", preview: false, ...(label === undefined ? {} : { label }),
+	});
+}
+
+function contextInputEcho(toolName: string, args: unknown): string | undefined {
+	if (toolName !== "ctx_execute" && toolName !== "ctx_execute_file") return undefined;
+	const record = asRecord(args);
+	if (typeof record?.language !== "string" || typeof record.code !== "string") return undefined;
+	const file = toolName === "ctx_execute_file";
+	if (file && typeof record.path !== "string") return undefined;
+	const code = record.code;
+	const shown = code.length <= 2000 ? code : `${code.slice(0, 2000)}\n… (truncated)`;
+	return `${file && record.path ? `path=${record.path}\n` : ""}\`\`\`${record.language}\n${shown}\n\`\`\`\n\n`;
+}
+
+function executionOutputText(
+	toolName: string,
+	args: unknown,
+	result: ToolResult | undefined,
+	showImages: boolean,
+): string {
+	const first = result?.content[0];
+	if (result && first?.type === "text") {
+		const echo = contextInputEcho(toolName, args);
+		let remaining: string | undefined;
+		if (echo !== undefined && first.text.startsWith(echo)) {
+			remaining = first.text.slice(echo.length);
+		} else if (toolName === "codemode" && /^Script (completed|failed)\nWall time [\d.]+ seconds\nOutput:\n$/.test(first.text)) {
+			remaining = "";
+		}
+		if (remaining !== undefined) {
+			const content = remaining.length === 0 ? result.content.slice(1)
+				: [{ ...first, text: remaining }, ...result.content.slice(1)];
+			return extractToolText({ ...result, content }, showImages);
+		}
+	}
+	return extractToolText(result, showImages);
+}
+
+function executionView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolView {
+	return toolName === "codemode" ? codemodeView(snapshot, theme) : contextExecutionView(toolName, snapshot, theme);
+}
+
+/** Match the native cents/two-significant-digit convention, including zero. */
+function executionCost(cost: number): string {
+	return `$${cost >= 0.01 ? cost.toFixed(2) : cost.toPrecision(2)}`;
+}
+
+function codemodeCallsSection(details: unknown, expanded: boolean, theme: Theme): ToolSection | undefined {
+	const calls = asRecord(details)?.calls;
+	if (!Array.isArray(calls) || calls.length === 0) return undefined;
+	const mode = getIconMode();
+	const states = {
+		running: { ascii: "...", nerd: "…", color: "warning" },
+		ok: { ascii: "ok", nerd: "✓", color: "success" },
+		error: { ascii: "!", nerd: "✗", color: "error" },
+		cancelled: { ascii: "-", nerd: "⊘", color: "muted" },
+	} as const;
+	const entries = calls.map((value: unknown) => {
+		const call = asRecord(value);
+		if (!call || typeof call.id !== "string" || typeof call.name !== "string"
+			|| typeof call.args !== "string" || typeof call.status !== "string"
+			|| !Object.hasOwn(states, call.status)) {
+			return normalizeDisplayText(jsonText(value, true));
+		}
+		const state = states[call.status as keyof typeof states];
+		const symbol = mode === "off" ? call.status : mode === "nerd-font" ? state.nerd : state.ascii;
+		const normalizedArgs = normalizeDisplayText(call.args);
+		const args = !expanded && normalizedArgs.length > 80 ? `${normalizedArgs.slice(0, 77)}...` : normalizedArgs;
+		let line = `${theme.fg(state.color, symbol)} ${theme.fg("toolTitle", normalizeDisplayText(call.name))}`;
+		if (args) line += ` ${theme.fg("muted", args)}`;
+		const duration = finiteNumber(call.durationMs);
+		if (duration !== undefined && duration >= 0) {
+			line += ` ${theme.fg("dim", duration < 1000 ? `${Math.round(duration)}ms` : `${(duration / 1000).toFixed(1)}s`)}`;
+		}
+		const cost = finiteNumber(call.cost);
+		if (cost !== undefined && cost >= 0) line += ` ${theme.fg("dim", executionCost(cost))}`;
+		if (expanded && typeof call.error === "string" && call.error.length > 0) {
+			line += `\n    ${theme.fg("error", normalizeDisplayText(call.error).split("\n").join("\n    "))}`;
+		}
+		return line;
+	});
+	return {
+		label: "Calls", slot: "result", component: entriesComponent(entries),
+		previewPolicy: { edge: "tail", count: 8, unit: "entries" },
+	};
+}
+
+function codemodeView(snapshot: ToolSnapshot, theme: Theme): ToolView {
+	const args = snapshot.args;
+	const record = asRecord(args);
+	const extraEntries = argEntries(args).filter(([key]) => key !== "code");
+	const details = asRecord(snapshot.result?.details);
+	const calls = details?.calls;
+	let total = 0;
+	let positiveCosts = 0;
+	if (Array.isArray(calls)) {
+		for (const call of calls) {
+			const cost = finiteNumber(asRecord(call)?.cost);
+			if (cost !== undefined && cost >= 0) {
+				total += cost;
+				if (cost > 0) positiveCosts++;
+			}
+		}
+	}
+	const output = snapshot.context.isPartial ? ""
+		: executionOutputText("codemode", args, snapshot.result, snapshot.context.showImages);
+	const fullOutputPath = details?.fullOutputPath;
+	const view: ToolView = {
+		layout: "framed",
+		head: makeHead("codemode", "", [], snapshot),
+		sections: sectionsOf(
+			executionCodeSection(argValue(record, "code"), "javascript", snapshot.context.state, theme, "Input"),
+			extraEntries.length > 0 ? executionArgumentsSection(Object.fromEntries(extraEntries)) : undefined,
+			codemodeCallsSection(snapshot.result?.details, snapshot.context.expanded, theme),
+			positiveCosts > 1 ? section([theme.fg("muted", `Model calls: ${executionCost(total)}`)], { preview: false }) : undefined,
+			section(output.split("\n"), { label: "Output", slot: "result", previewPolicy: EXECUTION_OUTPUT_PREVIEW }),
+			typeof fullOutputPath === "string" && fullOutputPath.length > 0
+				? section([theme.fg("muted", `Full output: ${normalizeDisplayText(fullOutputPath)}`)], { preview: false }) : undefined,
+		),
+		expanded: snapshot.context.expanded,
+	};
+	if (snapshot.context.isError) view.tone = "error";
+	return view;
+}
+
+function contextExecutionView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolView {
+	const args = snapshot.args;
+	const record = asRecord(args);
+	const known = toolName === "ctx_execute" || toolName === "ctx_execute_file";
+	const callSections: ToolSection[] = [];
+	if (known) {
+		const metadata: string[] = [];
+		const fields = toolName === "ctx_execute_file" ? ["path", "language"] : ["language"];
+		for (const field of fields) {
+			const value = argValue(record, field);
+			metadata.push(`${field}: ${value === undefined ? PENDING : value === WRONG_TYPE ? INVALID_ARG : normalizeDisplayText(value)}`);
+		}
+		callSections.push(section(metadata, { label: "Input", slot: "call", preview: false })!);
+		const language = argValue(record, "language");
+		callSections.push(executionCodeSection(
+			argValue(record, "code"), typeof language === "string" ? language : undefined,
+			snapshot.context.state, theme,
+		));
+		const consumed = new Set([...fields, "code"]);
+		const options = argEntries(args).filter(([key]) => !consumed.has(key));
+		if (options.length > 0) {
+			const lines = options.flatMap(([key, value]) => normalizeDisplayText(
+				`${key}: ${jsonText(value, false)}${key === "timeout" && typeof value === "number" ? " ms" : ""}`,
+			).split("\n"));
+			callSections.push(section(lines, { slot: "call", preview: false })!);
+		}
+	} else {
+		const text = args === undefined ? PENDING : normalizeDisplayText(jsonText(args, true));
+		const primary = reuseToolSection(snapshot.context.state, theme, "execution-arguments", [toolName, text], () => {
+			const input = executionArgumentsSection(args, "Input");
+			if (input) {
+				input.preview = true;
+				input.previewPolicy = EXECUTION_INPUT_PREVIEW;
+			}
+			return input;
+		});
+		if (primary) callSections.push(primary);
+	}
+	const output = executionOutputText(toolName, args, snapshot.result, snapshot.context.showImages);
+	const view: ToolView = {
+		layout: "framed",
+		head: makeHead(normalizeDisplayText(toolName), "", [], snapshot),
+		sections: sectionsOf(
+			...callSections,
+			section(output.split("\n"), { label: "Output", slot: "result", previewPolicy: EXECUTION_OUTPUT_PREVIEW }),
+		),
+		expanded: snapshot.context.expanded,
+	};
+	if (snapshot.context.isError) view.tone = "error";
+	return view;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -497,24 +784,27 @@ function genericView(toolName: string, snapshot: ToolSnapshot): ToolView {
 /* -------------------------------------------------------------------------- */
 
 function shellView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolView {
-	const args = asRecord(snapshot.args ?? snapshot.context.args);
-	const command = argValue(args, "command");
-	const timeout = finiteNumber(args?.timeout);
+	const value = suppliedArgs(snapshot);
+	const args = asRecord(value);
+	const command = args?.command;
 	const isPowerShell = toolName === "powershell";
 	const prompt = isPowerShell ? "PS> " : "$ ";
-
-	const meta: string[] = [];
-	if (timeout !== undefined) {
-		meta.push(`${timeout}s`);
+	const commandText = args
+		? `${typeof command === "string" ? prompt : ""}${stringInput(command)}`
+		: value === undefined ? PENDING : argumentText(value, true);
+	const options: string[] = [];
+	if (args) {
+		const entries = Object.entries(args);
+		for (const [key, entry] of entries) {
+			if (key !== "command") {
+				options.push(`${normalizeDisplayText(key)}: ${key === "timeout" && finiteNumber(entry) !== undefined ? `${entry}s` : argumentText(entry)}`);
+			}
+		}
+		if (entries.length === 0) {
+			options.push("{}");
+		}
 	}
-
-	const target =
-		command === undefined
-			? PENDING
-			: command === WRONG_TYPE
-				? INVALID_ARG
-				: `${prompt}${normalizeDisplayText(command)}`;
-	const head = makeHead(isPowerShell ? "PowerShell" : "Bash", target, meta, snapshot);
+	const head = makeHead(isPowerShell ? "PowerShell" : "Bash", "", [], snapshot);
 
 	const output = extractToolText(snapshot.result, snapshot.context.showImages).trim();
 	const details = asRecord(snapshot.result?.details);
@@ -533,6 +823,8 @@ function shellView(toolName: string, snapshot: ToolSnapshot, theme: Theme): Tool
 		layout: "framed",
 		head,
 		sections: sectionsOf(
+			section(commandText.split("\n"), { label: "Command", slot: "call", previewPolicy: COMMAND_PREVIEW }),
+			options.length > 0 ? section(options, { slot: "call", preview: false }) : undefined,
 			reuseToolSection(snapshot.context.state, theme, "shell-output", [output], () =>
 				output.length > 0 ? section(output.split("\n"), { label: "Output", slot: "result" }) : undefined,
 			),
@@ -552,19 +844,9 @@ function shellView(toolName: string, snapshot: ToolSnapshot, theme: Theme): Tool
 /* -------------------------------------------------------------------------- */
 
 function readView(snapshot: ToolSnapshot, theme: Theme): ToolView {
-	const args = asRecord(snapshot.args ?? snapshot.context.args);
+	const args = asRecord(suppliedArgs(snapshot));
 	const rawPath = argValue(args, "path");
-	const offset = finiteNumber(args?.offset);
-	const limit = finiteNumber(args?.limit);
-
-	let range = "";
-	if (offset !== undefined || limit !== undefined) {
-		const start = offset ?? 1;
-		const end = limit !== undefined ? start + limit - 1 : undefined;
-		range = end !== undefined ? `:${start}-${end}` : `:${start}`;
-	}
-
-	const head = makeHead("Read", `${pathTarget(rawPath, theme, snapshot.context.cwd)}${range}`, [], snapshot);
+	const head = makeHead("Read", "", [], snapshot);
 
 	const result = snapshot.result;
 	const isError = snapshot.context.isError;
@@ -580,6 +862,7 @@ function readView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 		if (lang === "markdown") {
 			contentSection = reuseToolSection(state, theme, "read-markdown", [bodyText], () => ({
 				component: new Markdown(bodyText, 0, 0, getMarkdownTheme()),
+				label: "Output",
 				slot: "result",
 				preview: true,
 				renderedWidth: "padded",
@@ -587,14 +870,14 @@ function readView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 		} else if (lang) {
 			const language = lang;
 			contentSection = reuseToolSection(state, theme, "read-code", [language, bodyText], () =>
-				section(highlightCode(bodyText, language), { preview: true, slot: "result" }),
+				section(highlightCode(bodyText, language), { label: "Output", preview: true, slot: "result" }),
 			);
 		} else {
 			const color = isError ? "error" : "toolOutput";
 			contentSection = reuseToolSection(state, theme, "read-text", [color, bodyText], () =>
 				section(
 					bodyLines.map((line) => theme.fg(color, line)),
-					{ preview: true, slot: "result" },
+					{ label: "Output", preview: true, slot: "result" },
 				),
 			);
 		}
@@ -623,9 +906,10 @@ function readView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 	}
 
 	const view: ToolView = {
-		layout: "inline",
+		layout: "framed",
 		head,
 		sections: sectionsOf(
+			nativeInputSection(snapshot, theme, ["path"]),
 			contentSection,
 			warnings.length > 0 ? section(warnings.map((line) => theme.fg("warning", line)), { preview: false }) : undefined,
 		),
@@ -643,51 +927,33 @@ function readView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 /* -------------------------------------------------------------------------- */
 
 function writeView(snapshot: ToolSnapshot, theme: Theme): ToolView {
-	const args = asRecord(snapshot.args ?? snapshot.context.args);
+	const args = asRecord(suppliedArgs(snapshot));
 	const rawPath = argValue(args, "path");
-	const contentValue = args?.content;
-	const content = typeof contentValue === "string" ? contentValue : undefined;
+	const content = args?.content;
 	const isError = snapshot.context.isError;
-
-	const meta: string[] = [];
-	let contentSection: ToolSection | undefined;
-	if (content !== undefined) {
-		const lang = rawPath !== undefined && rawPath !== WRONG_TYPE ? getLanguageFromPath(rawPath) : undefined;
-		const normalized = normalizeDisplayText(content);
-		const bodyLines = trimTrailingEmptyLines(normalized.split("\n"));
-		meta.push(`${bodyLines.length} lines`);
-		const state = snapshot.context.state;
-		if (lang) {
-			const language = lang;
-			contentSection = reuseToolSection(state, theme, "write-code", [language, normalized], () =>
-				section(highlightCode(normalized, language), { label: "Content", slot: "call", preview: true }),
-			);
-		} else {
-			contentSection = reuseToolSection(state, theme, "write-text", [normalized], () =>
-				section(bodyLines.map((line) => theme.fg("toolOutput", line)), { label: "Content", slot: "call", preview: true }),
-			);
-		}
-	} else if (contentValue !== undefined) {
-		contentSection = section([theme.fg("error", INVALID_ARG)], { label: "Content", slot: "call", preview: false });
-	}
-
-	const head = makeHead("Write", pathTarget(rawPath, theme, snapshot.context.cwd), meta, snapshot);
-
-	const resultText = extractToolText(snapshot.result, snapshot.context.showImages).trim();
-	const errorSection =
-		isError && resultText.length > 0
-			? section(resultText.split("\n").map((line) => theme.fg("error", line)), {
-					label: "Error",
-					slot: "result",
-					preview: false,
-				})
-			: undefined;
-
+	const normalized = typeof content === "string" ? normalizeDisplayText(content) : undefined;
+	const literal = normalized !== undefined && normalized.trim().length === 0;
+	const text = typeof content === "string" && !literal ? normalized! : `content: ${stringInput(content)}`;
+	const lang = !literal && typeof content === "string" && typeof rawPath === "string" ? getLanguageFromPath(rawPath) : undefined;
+	const color = content !== undefined && typeof content !== "string" ? "error" : "toolOutput";
+	const contentSection = reuseToolSection(
+		snapshot.context.state, theme, "write-input", [text, lang, literal, color],
+		() => section(lang ? highlightCode(text, lang) : text.split("\n").map((line) => theme.fg(color, line)), {
+			slot: "call", previewPolicy: WRITE_PREVIEW,
+		}),
+	);
+	const meta = normalized === undefined ? [] : [`${trimTrailingEmptyLines(normalized.split("\n")).length} lines`];
+	const head = makeHead("Write", "", meta, snapshot);
+	const resultText = extractToolText(snapshot.result, snapshot.context.showImages);
+	const resultSection = resultText.length > 0
+		? section(resultText.split("\n").map((line) => theme.fg(isError ? "error" : "toolOutput", line)), {
+			label: isError ? "Error" : "Output", slot: "result", preview: !isError, previewPolicy: WRITE_PREVIEW,
+		}) : undefined;
 	const view: ToolView = {
 		layout: "framed",
 		head,
-		sections: sectionsOf(contentSection, errorSection),
-		preview: { edge: "head", count: 8, unit: "visual-lines" },
+		sections: sectionsOf(nativeInputSection(snapshot, theme, ["path"], ["content"], false), contentSection, resultSection),
+		preview: WRITE_PREVIEW,
 		expanded: snapshot.context.expanded,
 	};
 	if (isError) {
@@ -700,44 +966,82 @@ function writeView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 /* Edit                                                                       */
 /* -------------------------------------------------------------------------- */
 
-interface EditPair {
-	oldText: string;
-	newText: string;
-}
-
-function collectEditPairs(args: Record<string, unknown> | undefined): EditPair[] | undefined {
-	if (!args) {
-		return undefined;
-	}
-	const edits = args.edits;
-	if (Array.isArray(edits) && edits.length > 0) {
-		const pairs: EditPair[] = [];
-		for (const edit of edits) {
-			const record = asRecord(edit);
-			if (typeof record?.oldText !== "string" || typeof record.newText !== "string") {
-				return undefined;
-			}
-			pairs.push({ oldText: record.oldText, newText: record.newText });
-		}
-		return pairs;
-	}
-	if (typeof args.oldText === "string" && typeof args.newText === "string") {
-		return [{ oldText: args.oldText, newText: args.newText }];
-	}
-	return undefined;
-}
-
-function editPreviewLines(pairs: readonly EditPair[], theme: Theme): string[] {
+/** Show the delivered request, not a reconstructed version of the result diff. */
+function editRequestLines(args: Record<string, unknown> | undefined, theme: Theme): string[] {
 	const lines: string[] = [];
-	for (const pair of pairs) {
-		for (const line of normalizeDisplayText(pair.oldText).split("\n")) {
-			lines.push(theme.fg("toolDiffRemoved", `-${line}`));
+	const hasEdits = args !== undefined && Object.hasOwn(args, "edits");
+	const edits = args?.edits;
+	const requests: unknown[] = [];
+	if (hasEdits) {
+		if (Array.isArray(edits) && edits.length > 0) {
+			requests.push(...edits);
+		} else {
+			lines.push(`edits: ${edits === undefined ? PENDING : `${INVALID_ARG} (${argumentText(edits, true)})`}`);
 		}
-		for (const line of normalizeDisplayText(pair.newText).split("\n")) {
-			lines.push(theme.fg("toolDiffAdded", `+${line}`));
+	}
+	if (!hasEdits || Object.hasOwn(args!, "oldText") || Object.hasOwn(args!, "newText")) {
+		requests.push({ oldText: args?.oldText, newText: args?.newText });
+	}
+	for (const request of requests) {
+		const pair = asRecord(request);
+		if (!pair) {
+			lines.push(`${INVALID_ARG} (${argumentText(request, true)})`);
+			continue;
+		}
+		if (typeof pair.oldText === "string" && typeof pair.newText === "string") {
+			for (const line of stringInput(pair.oldText).split("\n")) {
+				lines.push(theme.fg("toolDiffRemoved", `-${line}`));
+			}
+			for (const line of stringInput(pair.newText).split("\n")) {
+				lines.push(theme.fg("toolDiffAdded", `+${line}`));
+			}
+		} else {
+			lines.push(`oldText: ${stringInput(pair.oldText)}`, `newText: ${stringInput(pair.newText)}`);
+		}
+		for (const [key, entry] of Object.entries(pair)) {
+			if (key !== "oldText" && key !== "newText") {
+				lines.push(`${normalizeDisplayText(key)}: ${argumentText(entry)}`);
+			}
 		}
 	}
 	return lines;
+}
+
+/** Key the displayed request fields individually: JSON merges null/NaN and absent/undefined. */
+function editRequestParts(args: Record<string, unknown> | undefined): PrimaryPart[] {
+	const hasEdits = args !== undefined && Object.hasOwn(args, "edits");
+	const parts: PrimaryPart[] = [
+		hasEdits,
+		args !== undefined && Object.hasOwn(args, "oldText"),
+		args !== undefined && Object.hasOwn(args, "newText"),
+		typeof args?.oldText === "string", typeof args?.newText === "string",
+		argumentText(args?.oldText), argumentText(args?.newText),
+	];
+	if (!hasEdits) {
+		return parts;
+	}
+	const edits = args!.edits;
+	if (!Array.isArray(edits) || edits.length === 0) {
+		parts.push(argumentText(edits, true));
+		return parts;
+	}
+	parts.push(edits.length);
+	for (const request of edits) {
+		const pair = asRecord(request);
+		if (!pair) {
+			parts.push(false, argumentText(request, true));
+			continue;
+		}
+		const entries = Object.entries(pair);
+		parts.push(true, typeof pair.oldText === "string", typeof pair.newText === "string",
+			argumentText(pair.oldText), argumentText(pair.newText), entries.length);
+		for (const [key, entry] of entries) {
+			if (key !== "oldText" && key !== "newText") {
+				parts.push(normalizeDisplayText(key), argumentText(entry));
+			}
+		}
+	}
+	return parts;
 }
 
 function editDiffStats(diff: string): { added: number; removed: number } {
@@ -754,7 +1058,7 @@ function editDiffStats(diff: string): { added: number; removed: number } {
 }
 
 function editView(snapshot: ToolSnapshot, theme: Theme): ToolView {
-	const args = asRecord(snapshot.args ?? snapshot.context.args);
+	const args = asRecord(suppliedArgs(snapshot));
 	const rawPath = argValue(args, "path");
 	const filePath = rawPath !== undefined && rawPath !== WRONG_TYPE ? rawPath : undefined;
 	const isError = snapshot.context.isError;
@@ -771,21 +1075,22 @@ function editView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 		meta.push(`+${stats.added} −${stats.removed}`);
 	}
 
-	const head = makeHead("Edit", pathTarget(rawPath, theme, snapshot.context.cwd), meta, snapshot);
+	const head = makeHead("Edit", "", meta, snapshot);
 
-	const resultText = extractToolText(snapshot.result, snapshot.context.showImages).trim();
+	const resultText = extractToolText(snapshot.result, snapshot.context.showImages);
 
 	let primary: ToolSection | undefined;
 	const state = snapshot.context.state;
+	const buildRequest = () => section(editRequestLines(args, theme), { slot: "call", previewPolicy: INPUT_PREVIEW });
+	// The active request and final result share the one retained-primary slot.
+	// Final Input is ordinary; whole-view retention still keeps it stable on ticks/resize.
+	const request = finalized ? buildRequest() : reuseToolSection(state, theme, "edit-request", editRequestParts(args), buildRequest);
 	if (isError) {
 		if (resultText.length > 0) {
-			primary = reuseToolSection(state, theme, "edit-error", [resultText], () =>
-				section(resultText.split("\n").map((line) => theme.fg("error", line)), {
-					label: "Error",
-					slot: "result",
-					preview: false,
-				}),
-			);
+			const buildError = () => section(resultText.split("\n").map((line) => theme.fg("error", line)), {
+				label: "Error", slot: "result", preview: false,
+			});
+			primary = finalized ? reuseToolSection(state, theme, "edit-error", [resultText], buildError) : buildError();
 		}
 	} else if (resultDiff !== undefined && resultDiff.length > 0) {
 		const diff = resultDiff;
@@ -794,6 +1099,7 @@ function editView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 				label: "Diff",
 				slot: "result",
 				preview: true,
+				previewPolicy: INPUT_PREVIEW,
 			}),
 		);
 	} else if (finalized && resultText.length > 0) {
@@ -802,23 +1108,15 @@ function editView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 				label: "Diff",
 				slot: "result",
 				preview: true,
+				previewPolicy: INPUT_PREVIEW,
 			}),
 		);
-	} else if (!finalized) {
-		const pairs = collectEditPairs(args);
-		if (pairs) {
-			const editPairs = pairs;
-			const parts = editPairs.flatMap((pair) => [pair.oldText, pair.newText]);
-			primary = reuseToolSection(state, theme, "edit-preview", parts, () =>
-				section(editPreviewLines(editPairs, theme), { label: "Preview", slot: "call", preview: true }),
-			);
-		}
 	}
 
 	const view: ToolView = {
 		layout: "framed",
 		head,
-		sections: sectionsOf(primary),
+		sections: sectionsOf(nativeInputSection(snapshot, theme, ["path"], ["oldText", "newText", "edits"], false), request, primary),
 		preview: { edge: "head", count: 10, unit: "visual-lines" },
 		expanded: snapshot.context.expanded,
 	};
@@ -833,25 +1131,7 @@ function editView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 /* -------------------------------------------------------------------------- */
 
 function findView(snapshot: ToolSnapshot, theme: Theme): ToolView {
-	const args = asRecord(snapshot.args ?? snapshot.context.args);
-	const pattern = argValue(args, "pattern");
-	const rawPath = argValue(args, "path");
-	const limit = finiteNumber(args?.limit);
-
-	const meta: string[] = [];
-	if (rawPath !== undefined && rawPath !== WRONG_TYPE && rawPath !== "") {
-		meta.push(singleLineText(`in ${shortenPath(rawPath)}`));
-	}
-	if (limit !== undefined) {
-		meta.push(`limit ${limit}`);
-	}
-
-	const head = makeHead(
-		"Find",
-		pattern === undefined ? PENDING : pattern === WRONG_TYPE ? INVALID_ARG : normalizeDisplayText(pattern),
-		meta,
-		snapshot,
-	);
+	const head = makeHead("Find", "", [], snapshot);
 
 	const output = extractToolText(snapshot.result, snapshot.context.showImages).trim();
 	const entryLines = output.length > 0 ? trimTrailingEmptyLines(output.split("\n")) : [];
@@ -873,15 +1153,17 @@ function findView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 		entryLines.length > 0
 			? reuseToolSection(snapshot.context.state, theme, "find-entries", [output], () => ({
 					component: entriesComponent(entryLines.map((line) => theme.fg("toolOutput", line))),
+					label: "Output",
 					slot: "result",
 					preview: true,
 				}))
 			: undefined;
 
 	const view: ToolView = {
-		layout: "inline",
+		layout: "framed",
 		head,
 		sections: sectionsOf(
+			nativeInputSection(snapshot, theme, ["pattern"]),
 			entrySection,
 			warnings.length > 0 ? section([theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)], { preview: false }) : undefined,
 		),
@@ -899,39 +1181,7 @@ function findView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 /* -------------------------------------------------------------------------- */
 
 function grepView(snapshot: ToolSnapshot, theme: Theme): ToolView {
-	const args = asRecord(snapshot.args ?? snapshot.context.args);
-	const pattern = argValue(args, "pattern");
-	const rawPath = argValue(args, "path");
-	const glob = argValue(args, "glob");
-	const limit = finiteNumber(args?.limit);
-	const contextLines = finiteNumber(args?.context);
-
-	const meta: string[] = [];
-	if (rawPath !== undefined && rawPath !== WRONG_TYPE && rawPath !== "") {
-		meta.push(singleLineText(`in ${shortenPath(rawPath)}`));
-	}
-	if (glob !== undefined && glob !== WRONG_TYPE && glob !== "") {
-		meta.push(singleLineText(glob));
-	}
-	if (args?.ignoreCase === true) {
-		meta.push("ignore-case");
-	}
-	if (args?.literal === true) {
-		meta.push("literal");
-	}
-	if (contextLines !== undefined) {
-		meta.push(`context ${contextLines}`);
-	}
-	if (limit !== undefined) {
-		meta.push(`limit ${limit}`);
-	}
-
-	const head = makeHead(
-		"Grep",
-		pattern === undefined ? PENDING : pattern === WRONG_TYPE ? INVALID_ARG : normalizeDisplayText(pattern),
-		meta,
-		snapshot,
-	);
+	const head = makeHead("Grep", "", [], snapshot);
 
 	const output = extractToolText(snapshot.result, snapshot.context.showImages).trim();
 	const outputLines = output.length > 0 ? output.split("\n") : [];
@@ -951,11 +1201,12 @@ function grepView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 	}
 
 	const view: ToolView = {
-		layout: "inline",
+		layout: "framed",
 		head,
 		sections: sectionsOf(
+			nativeInputSection(snapshot, theme, ["pattern"]),
 			reuseToolSection(snapshot.context.state, theme, "grep-output", [output], () =>
-				section(outputLines.map((line) => theme.fg("toolOutput", line)), { preview: true, slot: "result" }),
+				section(outputLines.map((line) => theme.fg("toolOutput", line)), { label: "Output", preview: true, slot: "result" }),
 			),
 			warnings.length > 0 ? section([theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)], { preview: false }) : undefined,
 		),
@@ -973,17 +1224,7 @@ function grepView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 /* -------------------------------------------------------------------------- */
 
 function lsView(snapshot: ToolSnapshot, theme: Theme): ToolView {
-	const args = asRecord(snapshot.args ?? snapshot.context.args);
-	const rawPath = argValue(args, "path");
-	const limit = finiteNumber(args?.limit);
-
-	const meta: string[] = [];
-	if (limit !== undefined) {
-		meta.push(`limit ${limit}`);
-	}
-
-	const target = rawPath === undefined || rawPath === "" ? "." : rawPath;
-	const head = makeHead("Ls", renderPath(target, theme, snapshot.context.cwd), meta, snapshot);
+	const head = makeHead("Ls", "", [], snapshot);
 
 	const output = extractToolText(snapshot.result, snapshot.context.showImages).trim();
 	const outputLines = output.length > 0 ? output.split("\n") : [];
@@ -1000,11 +1241,12 @@ function lsView(snapshot: ToolSnapshot, theme: Theme): ToolView {
 	}
 
 	const view: ToolView = {
-		layout: "inline",
+		layout: "framed",
 		head,
 		sections: sectionsOf(
+			nativeInputSection(snapshot, theme, []),
 			reuseToolSection(snapshot.context.state, theme, "ls-output", [output], () =>
-				section(outputLines.map((line) => theme.fg("toolOutput", line)), { preview: true, slot: "result" }),
+				section(outputLines.map((line) => theme.fg("toolOutput", line)), { label: "Output", preview: true, slot: "result" }),
 			),
 			warnings.length > 0 ? section([theme.fg("warning", `[Truncated: ${warnings.join(", ")}]`)], { preview: false }) : undefined,
 		),
@@ -1084,7 +1326,29 @@ function jsonText(value: unknown, pretty: boolean): string {
 		const text = pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value);
 		return text ?? String(value);
 	} catch {
-		return String(value);
+		// Preserve delivered fields on the exceptional bigint/cycle path as well.
+		const ancestors: object[] = [];
+		try {
+			const text = JSON.stringify(value, function (_key, entry: unknown): unknown {
+				if (typeof entry === "bigint") {
+					return String(entry);
+				}
+				if (typeof entry !== "object" || entry === null) {
+					return entry;
+				}
+				while (ancestors.length > 0 && ancestors.at(-1) !== this) {
+					ancestors.pop();
+				}
+				if (ancestors.includes(entry)) {
+					return "[Circular]";
+				}
+				ancestors.push(entry);
+				return entry;
+			}, pretty ? 2 : undefined);
+			return text ?? String(value);
+		} catch {
+			return String(value);
+		}
 	}
 }
 
@@ -1098,21 +1362,6 @@ function argEntries(args: unknown): Array<[string, unknown]> {
 	return [["args", args]];
 }
 
-function mcpArgumentsSection(args: unknown, expanded: boolean): ToolSection | undefined {
-	const entries = argEntries(args);
-	if (entries.length === 0) {
-		return undefined;
-	}
-	const lines: string[] = [];
-	if (expanded) {
-		lines.push(...normalizeDisplayText(jsonText(args, true)).split("\n"));
-	} else {
-		const pairs = entries.map(([key, value]) => `${key}=${jsonText(value, false)}`).join(" ");
-		const preview = pairs.length > COLLAPSED_ARGS_CHARS ? `${pairs.slice(0, COLLAPSED_ARGS_CHARS - 3)}...` : pairs;
-		lines.push(normalizeDisplayText(preview));
-	}
-	return section(lines, { label: "Arguments", slot: "call", preview: true });
-}
 
 function mcpView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolView {
 	const identity = mcpIdentity(toolName, snapshot);
@@ -1127,7 +1376,7 @@ function mcpView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolVi
 		layout: "framed",
 		head,
 		sections: sectionsOf(
-			mcpArgumentsSection(snapshot.args ?? snapshot.context.args, snapshot.context.expanded),
+			fullArgumentsSection(suppliedArgs(snapshot)),
 			reuseToolSection(snapshot.context.state, theme, "mcp-output", [isError ? "error" : "toolOutput", output], () => {
 				const outputLines =
 					output.length > 0 ? output.split("\n").map((line) => theme.fg(isError ? "error" : "toolOutput", line)) : [];
@@ -1153,41 +1402,15 @@ function mcpView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolVi
 /* -------------------------------------------------------------------------- */
 
 function mcpResourceView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolView {
-	const args = asRecord(snapshot.args ?? snapshot.context.args);
 	const title = MCP_RESOURCE_TITLES[toolName] ?? "MCP Resource";
-	const reading = toolName === "read_mcp_resource";
-	const server = argValue(args, "server");
-	const uri = argValue(args, "uri");
-
-	const meta: string[] = [];
-	if (reading && server !== undefined && server !== WRONG_TYPE) {
-		meta.push(singleLineText(`server: ${server}`));
-	}
-
-	const target = reading
-		? uri === undefined
-			? PENDING
-			: uri === WRONG_TYPE
-				? INVALID_ARG
-				: normalizeDisplayText(uri)
-		: server === undefined
-			? "all servers"
-			: server === WRONG_TYPE
-				? INVALID_ARG
-				: normalizeDisplayText(server);
-	const head = makeHead(title, target, meta, snapshot);
-
-	const consumed = new Set<string>(reading ? ["server", "uri"] : ["server"]);
-	const remainingArgs = args
-		? Object.fromEntries(Object.entries(args).filter(([key]) => !consumed.has(key)))
-		: undefined;
+	const head = makeHead(title, "", [], snapshot);
 
 	const output = extractToolText(snapshot.result, snapshot.context.showImages).trim();
 	const view: ToolView = {
 		layout: "framed",
 		head,
 		sections: sectionsOf(
-			mcpArgumentsSection(remainingArgs, snapshot.context.expanded),
+			nativeInputSection(snapshot, theme, toolName === "read_mcp_resource" ? ["server", "uri"] : []),
 			reuseToolSection(
 				snapshot.context.state,
 				theme,
@@ -1242,9 +1465,11 @@ const BUILTIN_PRODUCERS: Record<string, (snapshot: ToolSnapshot, theme: Theme) =
 export function createToolView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolView {
 	const isMcpResource = MCP_RESOURCE_TITLES[toolName] !== undefined && sourceIsMcp(snapshot);
 	switch (snapshot.presentation) {
+		case "execution":
+			return executionView(toolName, snapshot, theme);
 		case "generic":
 		case "web":
-			return genericView(toolName, snapshot);
+			return genericView(toolName, snapshot, theme);
 		case "mcp":
 		case "mcp-unresolved":
 			return isMcpResource ? mcpResourceView(toolName, snapshot, theme) : mcpView(toolName, snapshot, theme);
@@ -1255,5 +1480,5 @@ export function createToolView(toolName: string, snapshot: ToolSnapshot, theme: 
 		return mcpResourceView(toolName, snapshot, theme);
 	}
 	const producer = BUILTIN_PRODUCERS[toolName];
-	return producer ? producer(snapshot, theme) : genericView(toolName, snapshot);
+	return producer ? producer(snapshot, theme) : genericView(toolName, snapshot, theme);
 }

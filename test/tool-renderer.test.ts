@@ -2,9 +2,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { initTheme, type Theme, type ToolInfo, type ToolRenderers } from "@earendil-works/pi-coding-agent";
-import { BashExecutionComponent } from "@earendil-works/pi-coding-agent";
+import { BashExecutionComponent, ToolExecutionComponent } from "@earendil-works/pi-coding-agent";
 import type { ToolRendererResolver } from "@earendil-works/pi-coding-agent";
-import { Text, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { Container, Text, hyperlink, stripTerminalSequences, type Component, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	createToolRendererResolver,
@@ -15,7 +15,10 @@ import {
 	setToolRendererEnabled,
 	setToolRendererImplementation,
 	type ToolRendererImplementation,
+	ToolRendererSession,
 	type ToolChildBounds,
+	getToolRendererRuntimeState,
+	type ToolLayout,
 } from "../src/tool-renderer.ts";
 import type { ToolContext, ToolSnapshot, ToolView } from "../src/tool-presentation.ts";
 import { isWebSearchTool } from "../src/web-search-presentation.ts";
@@ -24,6 +27,7 @@ import { uninstallShellRenderer } from "../src/render-decorator.ts";
 import { ExtensionRunner } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js";
 import { theme as piTheme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 import { loadSettings, saveSettings } from "../src/settings.ts";
+import { clearToolSpinners } from "../src/tool-spinner.ts";
 
 const theme = { fg: (_: string, text: string) => text, bg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
 const result = { content: [{ type: "text" as const, text: "RESULT_ONLY_MARKER" }], details: {} };
@@ -54,6 +58,14 @@ const mouse = (width: number, height: number, x = 1, y = 0): TuiMouseEvent => ({
 	type: "press", button: "left", x, y, screenX: 20 + x, screenY: 30 + y,
 	width, height, shift: false, alt: false, ctrl: false,
 });
+
+/** True when a rendered row is a framed section divider carrying the exact label. */
+function hasDivider(rows: readonly string[], label: string): boolean {
+	return rows.some((row) => {
+		const text = stripTerminalSequences(row);
+		return text.includes("├") && text.includes(` ${label} `);
+	});
+}
 
 
 let configDirectory: string;
@@ -667,5 +679,559 @@ describe("public presentation catalog without tool execution", () => {
 		expect(resolve("read", self, [metadata])).toBe(self);
 		invalidateToolPresentations("read");
 		expect(getToolPresentationCatalog([metadata]).find(({ name }) => name === "read")?.support).toBe("conditional");
+	});
+});
+
+describe("execution ownership through rendered facades", () => {
+	const key = Symbol.for("pi-tools-style:runtime");
+	const names = ["ctx_execute", "ctx_execute_file", "ctx_execute_future", "ctx_executeFuture", "codemode"];
+	let previous: unknown;
+	let session: { shutdown(): void };
+	beforeEach(() => {
+		previous = Reflect.get(globalThis, key);
+		Reflect.deleteProperty(globalThis, key);
+		session = installToolsStyle({ registerToolRenderer: vi.fn(), getAllTools: () => [] } as never).session;
+	});
+	afterEach(() => {
+		session.shutdown();
+		uninstallShellRenderer(BashExecutionComponent);
+		Reflect.set(globalThis, key, previous);
+	});
+	const downstream: ToolRenderers = {
+		renderShell: "self",
+		renderCall: () => new Text("EXECUTION_NATIVE_CALL", 0, 0),
+		renderResult: () => new Text("EXECUTION_NATIVE_RESULT", 0, 0),
+	};
+	function argsFor(name: string) {
+		return name === "codemode" ? { code: 'console.log("EXECUTION_INPUT")' }
+			: { language: "javascript", code: 'console.log("EXECUTION_INPUT")',
+				...(name === "ctx_execute_file" ? { path: "/offline/never-read.js" } : {}), background: false, timeout: 0 };
+	}
+	function renderedExecution(name: string, tools: ToolInfo[] = [], details: unknown = {}) {
+		const renderer = resolve(name, downstream, tools);
+		const ctx = context({ args: argsFor(name), isPartial: false });
+		const call = renderer.renderCall!(ctx.args, piTheme, ctx);
+		const output = renderer.renderResult!(
+			{ content: [{ type: "text", text: "EXECUTION_OUTPUT" }], details },
+			{ expanded: false, isPartial: false }, piTheme, ctx,
+		);
+		return {
+			renderer, call, output, ctx,
+			rows: () => call.render(120).concat(output.render(120)).map(stripTerminalSequences),
+		};
+	}
+	function expectOwned(name: string, rows: string[]) {
+		const rendered = rows.join("\n");
+		expect(rows[0]).toContain(name);
+		expect(rows[0]).not.toContain("EXECUTION_INPUT");
+		expect(hasDivider(rows, "Input")).toBe(false);
+		expect(hasDivider(rows, "Output")).toBe(true);
+		expect(rendered).toContain("EXECUTION_INPUT");
+		expect(rendered).toContain("EXECUTION_OUTPUT");
+		expect(rendered.indexOf("EXECUTION_INPUT")).toBeLessThan(rendered.indexOf("Output"));
+		expect(rendered).not.toContain("EXECUTION_NATIVE");
+		expect(rendered).not.toContain("Web Search");
+	}
+
+	for (const name of names) for (const provenance of ["absent", "builtin", "extension", "mcp"] as const) {
+		it(`owns ${name} instead of its self renderer with ${provenance} provenance`, () => {
+			const tools = provenance === "absent" ? [] : [
+				info(name, provenance === "mcp" ? "builtin:mcp" : provenance === "builtin" ? `builtin:${name}` : "/context-provider.ts",
+					provenance === "extension" ? "extension" : "builtin"),
+			];
+			const rendered = renderedExecution(name, tools);
+			expectOwned(name, rendered.rows());
+			setToolRendererEnabled(false);
+			expect(rendered.rows().join("\n")).toContain("EXECUTION_NATIVE_CALL");
+			expect(rendered.rows().join("\n")).toContain("EXECUTION_NATIVE_RESULT");
+			setToolRendererEnabled(true);
+			expectOwned(name, rendered.rows());
+		});
+	}
+
+	for (const name of ["ctx_batch_execute", "mcp__server__ctx_execute", "Codemode", "CTX_EXECUTE", "codemode_extra", "replace_match"]) {
+		it(`leaves the nonmatching ${name} self renderer's visible bodies untouched`, () => {
+			const rendered = renderedExecution(name, [info(name, "/context-provider.ts", "extension")]);
+			const expected = [
+				...downstream.renderCall!(rendered.ctx.args, piTheme, rendered.ctx).render(120),
+				...downstream.renderResult!(
+					{ content: [{ type: "text", text: "EXECUTION_OUTPUT" }], details: {} },
+					{ expanded: false, isPartial: false }, piTheme, rendered.ctx,
+				).render(120),
+			].map(stripTerminalSequences);
+			for (const enabled of [true, false, true]) {
+				setToolRendererEnabled(enabled);
+				expect(rendered.rows()).toEqual(expected);
+			}
+		});
+	}
+
+	for (const name of names) for (const configured of [false, true]) {
+		it(`does not promote ${name} to result-proven web on an existing card, configured=${configured}`, async () => {
+			if (configured) await saveSettings({ webSearchTools: [name] }, configPath);
+			const tools = [info(name, "builtin:mcp")];
+			const rendered = renderedExecution(name, tools);
+			expectOwned(name, rendered.rows());
+			rendered.renderer.renderResult!(
+				{ content: [{ type: "text", text: "EXECUTION_OUTPUT" }], details: {
+					server: "web-evidence", tool: "web_search",
+					response: { provider: "exa", answer: "MUST_NOT_REPLACE_EXECUTION_OUTPUT",
+						sources: [{ title: "MUST_NOT_RENDER_WEB_SOURCE", url: "https://example.org/web" }] },
+				} },
+				{ expanded: false, isPartial: false }, piTheme, rendered.ctx,
+			);
+			expectOwned(name, rendered.rows());
+			expect(rendered.rows().join("\n")).not.toContain("MUST_NOT_RENDER_WEB_SOURCE");
+			expect(rendered.rows().join("\n")).not.toContain("MUST_NOT_REPLACE_EXECUTION_OUTPUT");
+			rendered.renderer.renderResult!(
+				result, { expanded: false, isPartial: false }, piTheme, rendered.ctx,
+			);
+			const later = rendered.rows().join("\n");
+			expect(later).not.toMatch(/├─+ Input ─/u);
+			expect(later).toMatch(/├─+ Output ─/u);
+			expect(later).toContain("RESULT_ONLY_MARKER");
+			expect(later).not.toContain("Web Search");
+			expect(later).not.toContain("EXECUTION_NATIVE");
+		});
+	}
+
+	it("confirms only available or actually observed execution names without inventing availability", async () => {
+		const tools = [info("ctx_execute", "/context-provider.ts", "extension"), info("codemode", "builtin:codemode")];
+		await saveSettings({ tools: { ctx_execute_offline: false } }, configPath);
+		let catalog = getToolPresentationCatalog(tools);
+		expect(catalog.find(({ name }) => name === "ctx_execute")).toEqual({
+			name: "ctx_execute", presentation: "execution", available: true, support: "confirmed",
+		});
+		expect(catalog.find(({ name }) => name === "codemode")).toEqual({
+			name: "codemode", presentation: "execution", available: true, support: "confirmed",
+		});
+		expect(catalog.find(({ name }) => name === "ctx_execute_offline")).toEqual({
+			name: "ctx_execute_offline", presentation: "execution", available: false, support: "conditional",
+		});
+		expect(catalog.find(({ name }) => name === "ctx_execute_file")).toBeUndefined();
+		const observed = renderedExecution("ctx_execute_future");
+		expectOwned("ctx_execute_future", observed.rows());
+		catalog = getToolPresentationCatalog([]);
+		expect(catalog.find(({ name }) => name === "ctx_execute_future")).toEqual({
+			name: "ctx_execute_future", presentation: "execution", available: false, support: "confirmed",
+		});
+		expect(catalog.find(({ name }) => name === "ctx_execute_file")).toBeUndefined();
+	});
+});
+
+describe("uniform rich nonself downstream cards", () => {
+	const key = Symbol.for("pi-tools-style:runtime");
+	let previous: unknown;
+	let session: { shutdown(): void };
+	beforeEach(() => {
+		previous = Reflect.get(globalThis, key);
+		Reflect.deleteProperty(globalThis, key);
+		session = installToolsStyle({ registerToolRenderer: vi.fn(), getAllTools: () => [] } as never).session;
+	});
+	afterEach(() => {
+		session.shutdown();
+		uninstallShellRenderer(BashExecutionComponent);
+		Reflect.set(globalThis, key, previous);
+	});
+
+	function richChild(prefix: string, count: number): Container {
+		const child = new Container();
+		child.addChild(new Text(`\u001b[35m${prefix}_01\u001b[0m ${hyperlink("RICH_LINK", `https://example.org/${prefix}`)}`, 0, 0));
+		child.addChild(new Text(Array.from({ length: count - 1 }, (_, index) =>
+			`\u001b[32m${prefix}_${String(index + 2).padStart(2, "0")}\u001b[0m`,
+		).join("\n"), 0, 0));
+		return child;
+	}
+	function richCard(callChild: Component, resultChild: Component, downstreamOverrides: Partial<ToolRenderers> = {}) {
+		const downstream: ToolRenderers = {
+			renderCall: () => callChild,
+			renderResult: () => resultChild,
+			...downstreamOverrides,
+		};
+		const renderer = resolve("rich_extension", downstream, [info("rich_extension", "/rich-extension.ts", "extension")]);
+		const ctx = context({ args: { raw: "RAW_ARGS_MUST_NOT_REPLACE_RICH_INPUT" }, isPartial: false });
+		const delivered = { content: [{ type: "text" as const, text: "RAW_RESULT_MUST_NOT_REPLACE_RICH_OUTPUT" }], details: {} };
+		const call = renderer.renderCall!(ctx.args, piTheme, ctx);
+		const output = renderer.renderResult!(delivered, { expanded: false, isPartial: false }, piTheme, ctx);
+		return {
+			renderer, ctx, delivered, call, output,
+			rows: (width = 120) => call.render(width).concat(output.render(width)),
+			expand: () => {
+				renderer.renderCall!(ctx.args, piTheme, { ...ctx, expanded: true, lastComponent: call });
+				renderer.renderResult!(delivered, { expanded: true, isPartial: false }, piTheme,
+					{ ...ctx, expanded: true, lastComponent: output });
+			},
+		};
+	}
+
+	it("frames actual rich Input and Output with independent counters instead of replacing their bodies with raw data", () => {
+		const callChild = richChild("NATIVE_INPUT", 12);
+		const resultChild = richChild("NATIVE_OUTPUT", 9);
+		const card = richCard(callChild, resultChild);
+		const renderedRows = card.rows();
+		const rendered = renderedRows.map(stripTerminalSequences).join("\n");
+		expect(renderedRows[0]).toContain("rich_extension");
+		expect(stripTerminalSequences(renderedRows[0]!)).not.toContain("NATIVE_INPUT");
+		expect(rendered).not.toMatch(/├─+ Input ─/u);
+		expect(rendered).toContain("NATIVE_INPUT_10");
+		expect(rendered).not.toContain("NATIVE_INPUT_11");
+		expect(rendered).toContain("2 more lines");
+		expect(rendered).toMatch(/├─+ Output ─/u);
+		expect(rendered).toContain("NATIVE_OUTPUT_05");
+		expect(rendered).not.toContain("NATIVE_OUTPUT_06");
+		expect(rendered).toContain("4 more lines");
+		expect(rendered.indexOf("NATIVE_INPUT_10")).toBeLessThan(rendered.indexOf("NATIVE_OUTPUT_05"));
+		expect(rendered).not.toContain("RAW_ARGS");
+		expect(rendered).not.toContain("RAW_RESULT");
+		expect(renderedRows.join("\n")).toContain("\u001b[35m");
+		expect(renderedRows.join("\n")).toContain("\u001b]8;;https://example.org/NATIVE_INPUT\u001b\\");
+		expect(renderedRows.join("\n")).toContain("\u001b]8;;https://example.org/NATIVE_OUTPUT\u001b\\");
+		expect(renderedRows.filter((line) => stripTerminalSequences(line).startsWith("╰"))).toHaveLength(1);
+		expect(stripTerminalSequences(card.output.render(120).at(-1)!)).toMatch(/^╰/u);
+		card.expand();
+		const expanded = card.rows().map(stripTerminalSequences).join("\n");
+		expect(expanded).toContain("NATIVE_INPUT_12");
+		expect(expanded).toContain("NATIVE_OUTPUT_09");
+		expect(expanded).not.toContain("more lines");
+		expect(expanded).not.toContain("RAW_ARGS");
+		expect(expanded).not.toContain("RAW_RESULT");
+	});
+
+	it.each(["call", "result"] as const)("keeps an interactive %s child complete while independently clipping its passive sibling", (interactiveSlot) => {
+		const callChild = richChild("INTERACTIVE_INPUT", 12);
+		const resultChild = richChild("INTERACTIVE_OUTPUT", 9);
+		const interactive = interactiveSlot === "call" ? callChild : resultChild;
+		const handleMouse = vi.fn(() => ({ handled: true, focus: true }));
+		const child = Object.assign(interactive, { handleMouse, handleInput: vi.fn() });
+		const card = richCard(callChild, resultChild);
+		const rendered = card.rows().map(stripTerminalSequences).join("\n");
+		expect(rendered).not.toMatch(/├─+ Input ─/u);
+		expect(rendered).toMatch(/├─+ Output ─/u);
+		if (interactiveSlot === "call") {
+			expect(rendered).toContain("INTERACTIVE_INPUT_12");
+			expect(rendered).toContain("INTERACTIVE_OUTPUT_05");
+			expect(rendered).not.toContain("INTERACTIVE_OUTPUT_06");
+			expect(rendered).toContain("4 more lines");
+			expect(rendered).not.toContain("2 more lines");
+		} else {
+			expect(rendered).toContain("INTERACTIVE_OUTPUT_09");
+			expect(rendered).toContain("INTERACTIVE_INPUT_10");
+			expect(rendered).not.toContain("INTERACTIVE_INPUT_11");
+			expect(rendered).toContain("2 more lines");
+			expect(rendered).not.toContain("4 more lines");
+		}
+		const fragment = interactiveSlot === "call" ? card.call : card.output;
+		const fragmentRows = fragment.render(120);
+		const firstChildRow = fragmentRows.findIndex((line) => stripTerminalSequences(line).includes(
+			interactiveSlot === "call" ? "INTERACTIVE_INPUT_01" : "INTERACTIVE_OUTPUT_01",
+		));
+		const event = mouse(120, fragmentRows.length, 2, firstChildRow);
+		const dispatch = fragment.handleMouse!(event) as {
+			target: { component: Component }; focusTarget: Component;
+		};
+		expect(dispatch.target.component).toBe(child);
+		expect(dispatch.focusTarget).toBe(child);
+		expect(handleMouse).toHaveBeenCalledWith({
+			...event, x: 0, y: 0, width: 116, height: interactiveSlot === "call" ? 12 : 9,
+		});
+	});
+
+	it("refreshes visibly changed rich native output after the downstream context invalidates its retained card", () => {
+		let revision = 0;
+		let nativeContext: ToolContext | undefined;
+		const card = richCard(richChild("LIVE_INPUT", 12), richChild("INITIAL_OUTPUT", 9), {
+			renderResult: (_result, _options, _theme, ctx) => {
+				nativeContext = ctx;
+				return richChild(`LIVE_OUTPUT_${revision}`, 9);
+			},
+		});
+		expect(card.rows().map(stripTerminalSequences).join("\n")).toContain("LIVE_OUTPUT_0_05");
+		revision = 1;
+		nativeContext!.invalidate();
+		expect(card.ctx.invalidate).toHaveBeenCalledOnce();
+		const refreshed = card.rows().map(stripTerminalSequences).join("\n");
+		expect(refreshed).toContain("LIVE_OUTPUT_1_05");
+		expect(refreshed).not.toContain("LIVE_OUTPUT_0");
+		expect(refreshed).not.toContain("LIVE_OUTPUT_1_06");
+		expect(refreshed).toContain("4 more lines");
+		card.expand();
+		expect(card.rows().map(stripTerminalSequences).join("\n")).toContain("LIVE_OUTPUT_1_09");
+	});
+
+	it("retains rich native callbacks and bodies during enrolled real-component spinner transactions, then visibly rebuilds on native invalidation", () => {
+		vi.useFakeTimers();
+		clearToolSpinners();
+		const liveSession = new ToolRendererSession();
+		try {
+			const input = richChild("TICK_NATIVE_INPUT", 12);
+			const output = richChild("TICK_NATIVE_OUTPUT_0", 9);
+			let revision = 0;
+			let nativeContext: ToolContext | undefined;
+			const renderCall = vi.fn(() => input);
+			const renderResult = vi.fn<NonNullable<ToolRenderers["renderResult"]>>((_result, _options, _theme, ctx) => {
+				nativeContext = ctx;
+				output.clear();
+				output.addChild(new Text(Array.from({ length: 9 }, (_, index) =>
+					`TICK_NATIVE_OUTPUT_${revision}_${String(index + 1).padStart(2, "0")}`,
+				).join("\n"), 0, 0));
+				return output;
+			});
+			const layouts: ToolLayout[] = [];
+			const implementation = getToolRendererRuntimeState().implementation!;
+			const factory = vi.fn(implementation.createToolView);
+			const layout = vi.fn((...args: Parameters<ToolRendererImplementation["layoutToolView"]>) => {
+				const prepared = implementation.layoutToolView(...args);
+				layouts.push(prepared);
+				return prepared;
+			});
+			setToolRendererImplementation({ ...implementation, createToolView: factory, layoutToolView: layout });
+			const renderer = createToolRendererResolver({ getAllTools: () => [] }, liveSession)(
+				"rich_live_tick", () => ({ renderCall, renderResult }),
+			)!;
+			const component = new ToolExecutionComponent(
+				"rich_live_tick", "native-tick", { input: "RAW_INPUT" }, { outputPad: 1 },
+				renderer, { requestRender: vi.fn() } as never, process.cwd(),
+			);
+			liveSession.executionStarted("native-tick");
+			component.markExecutionStarted();
+			const delivered = { content: [{ type: "text" as const, text: "RAW_OUTPUT" }], details: {}, isError: false };
+			component.updateResult(delivered, true);
+			const before = component.render(120).map(stripTerminalSequences);
+			const headerIndex = before.findIndex((row) => row.startsWith("╭"));
+			expect(headerIndex).toBeGreaterThanOrEqual(0);
+			const body = before.slice(headerIndex + 1);
+			expect(body.join("\n")).toContain("TICK_NATIVE_OUTPUT_0_05");
+			expect(body.join("\n")).not.toContain("TICK_NATIVE_OUTPUT_0_06");
+			const prepared = layouts.at(-1)!;
+			const callRows = prepared.callRows, resultRows = prepared.resultRows;
+			const callBounds = prepared.callChildBounds, resultBounds = prepared.resultChildBounds;
+			const counts = [factory, layout, renderCall, renderResult].map((spy) => spy.mock.calls.length);
+			let previousHeader = before[headerIndex];
+			for (let tick = 0; tick < 3; tick++) {
+				vi.advanceTimersByTime(80);
+				const after = component.render(120).map(stripTerminalSequences);
+				expect(after[headerIndex]).not.toBe(previousHeader);
+				previousHeader = after[headerIndex];
+				expect(after.slice(headerIndex + 1)).toEqual(body);
+				expect([factory, layout, renderCall, renderResult].map((spy) => spy.mock.calls.length)).toEqual(counts);
+				expect(prepared.callRows).toBe(callRows);
+				expect(prepared.resultRows).toBe(resultRows);
+				expect(prepared.callChildBounds).toBe(callBounds);
+				expect(prepared.resultChildBounds).toBe(resultBounds);
+			}
+			revision = 1;
+			nativeContext!.invalidate();
+			const refreshed = component.render(120).map(stripTerminalSequences).join("\n");
+			expect(refreshed).toContain("TICK_NATIVE_OUTPUT_1_05");
+			expect(refreshed).not.toContain("TICK_NATIVE_OUTPUT_0");
+			expect(refreshed).not.toContain("TICK_NATIVE_OUTPUT_1_06");
+			expect(renderCall.mock.calls.length).toBeGreaterThan(counts[2]!);
+			expect(renderResult.mock.calls.length).toBeGreaterThan(counts[3]!);
+			liveSession.executionEnded("native-tick");
+			component.updateResult(delivered, false);
+		} finally {
+			liveSession.shutdown();
+			clearToolSpinners();
+			vi.useRealTimers();
+		}
+	});
+
+	it("uses complete argument and output fallbacks when native callbacks are absent, then previews each section independently", () => {
+		const renderer = resolve("extension_without_callbacks", {}, [info("extension_without_callbacks", "/fallback.ts", "extension")]);
+		const args = { long: "x".repeat(1200) + "FULL_INPUT_LAST", after: "LAST_ARGUMENT_FIELD" };
+		const ctx = context({ args, isPartial: false });
+		const delivered = {
+			content: [{ type: "text" as const, text: Array.from({ length: 15 }, (_, index) =>
+				`FALLBACK_OUTPUT_${String(index + 1).padStart(2, "0")}`,
+			).join("\n") }],
+			details: {},
+		};
+		const call = renderer.renderCall!(args, piTheme, ctx);
+		const output = renderer.renderResult!(delivered, { expanded: false, isPartial: false }, piTheme, ctx);
+		const collapsed = call.render(120).concat(output.render(120)).map(stripTerminalSequences).join("\n");
+		expect(collapsed).not.toMatch(/├─+ Input ─/u);
+		expect(collapsed).toMatch(/├─+ Output ─/u);
+		expect(collapsed).toContain("FALLBACK_OUTPUT_05");
+		expect(collapsed).not.toContain("FALLBACK_OUTPUT_06");
+		expect(collapsed).toContain("10 more lines");
+		renderer.renderCall!(args, piTheme, { ...ctx, expanded: true, lastComponent: call });
+		renderer.renderResult!(delivered, { expanded: true, isPartial: false }, piTheme,
+			{ ...ctx, expanded: true, lastComponent: output });
+		const expanded = call.render(120).concat(output.render(120)).map(stripTerminalSequences).join("\n");
+		expect(expanded).toContain("FULL_INPUT_LAST");
+		expect(expanded).toContain("LAST_ARGUMENT_FIELD");
+		expect(expanded).toContain("FALLBACK_OUTPUT_15");
+		expect(expanded).not.toContain("more lines");
+	});
+
+	for (const callback of ["missing", "throwing"] as const) {
+		it.each(["cyclic", "bigint"] as const)(`keeps safe generic Input and Output for %s arguments when the native call callback is ${callback}`, (kind) => {
+			const args: Record<string, unknown> = { marker: "SAFE_ARGUMENT_MARKER" };
+			if (kind === "cyclic") args.self = args;
+			else args.count = 9007199254740993n;
+			const downstream: ToolRenderers = callback === "missing" ? {} : {
+				renderCall: () => { throw new Error("native call renderer failed"); },
+			};
+			const renderer = resolve("safe_generic_args", downstream);
+			const ctx = context({ args, isPartial: false });
+			const call = renderer.renderCall!(args, piTheme, ctx);
+			const output = renderer.renderResult!({
+				content: [{ type: "text", text: "SAFE_DELIVERED_OUTPUT" }], details: {},
+			}, { expanded: false, isPartial: false }, piTheme, ctx);
+			const rendered = call.render(120).concat(output.render(120)).map(stripTerminalSequences).join("\n");
+			expect(rendered).not.toMatch(/├─+ Input ─/u);
+			expect(rendered).toContain("SAFE_ARGUMENT_MARKER");
+			expect(rendered).toContain(kind === "cyclic" ? "[Circular]" : "9007199254740993");
+			expect(rendered).toMatch(/├─+ Output ─/u);
+			expect(rendered).toContain("SAFE_DELIVERED_OUTPUT");
+			expect(rendered.indexOf("SAFE_ARGUMENT_MARKER")).toBeLessThan(rendered.indexOf("Output"));
+			renderer.renderCall!(args, piTheme, { ...ctx, lastComponent: call });
+			renderer.renderResult!({
+				content: [{ type: "text", text: "SAFE_UPDATED_OUTPUT" }], details: {},
+			}, { expanded: false, isPartial: false }, piTheme, { ...ctx, lastComponent: output });
+			const updated = call.render(120).concat(output.render(120)).map(stripTerminalSequences).join("\n");
+			expect(updated).not.toMatch(/├─+ Input ─/u);
+			expect(updated).toContain("SAFE_ARGUMENT_MARKER");
+			expect(updated).toContain(kind === "cyclic" ? "[Circular]" : "9007199254740993");
+			expect(updated).toContain("Output");
+			expect(updated).toContain("SAFE_UPDATED_OUTPUT");
+			expect(updated).not.toContain("SAFE_DELIVERED_OUTPUT");
+			if (kind === "cyclic") expect(args.self).toBe(args);
+			else expect(args.count).toBe(9007199254740993n);
+		});
+	}
+
+	it.each(["call", "result"] as const)("replaces only a failed native %s slot with its complete semantic fallback", (failedSlot) => {
+		const callChild = richChild("KEPT_NATIVE_INPUT", 12);
+		const resultChild = richChild("KEPT_NATIVE_OUTPUT", 9);
+		const downstream: ToolRenderers = {
+			renderCall: () => {
+				if (failedSlot === "call") throw new Error("call rendering failed");
+				return callChild;
+			},
+			renderResult: () => {
+				if (failedSlot === "result") throw new Error("result rendering failed");
+				return resultChild;
+			},
+		};
+		const renderer = resolve("independent_fallback", downstream);
+		const args = { long: "v".repeat(1200) + "FULL_INPUT_END", last: "LAST_FIELD" };
+		const ctx = context({ args, isPartial: false });
+		const delivered = {
+			content: [{ type: "text" as const, text: Array.from({ length: 15 }, (_, index) =>
+				`REAL_OUTPUT_${String(index + 1).padStart(2, "0")}`,
+			).join("\n") }],
+			details: {},
+		};
+		const call = renderer.renderCall!(args, piTheme, ctx);
+		const output = renderer.renderResult!(delivered, { expanded: false, isPartial: false }, piTheme, ctx);
+		const collapsed = call.render(120).concat(output.render(120)).map(stripTerminalSequences).join("\n");
+		expect(collapsed).not.toMatch(/├─+ Input ─/u);
+		expect(collapsed).toMatch(/├─+ Output ─/u);
+		if (failedSlot === "call") {
+			expect(collapsed).toContain("KEPT_NATIVE_OUTPUT_05");
+			expect(collapsed).not.toContain("KEPT_NATIVE_OUTPUT_06");
+			expect(collapsed).not.toContain("KEPT_NATIVE_INPUT");
+			expect(collapsed).not.toContain("REAL_OUTPUT");
+		} else {
+			expect(collapsed).toContain("KEPT_NATIVE_INPUT_10");
+			expect(collapsed).not.toContain("KEPT_NATIVE_INPUT_11");
+			expect(collapsed).toContain("REAL_OUTPUT_05");
+			expect(collapsed).not.toContain("REAL_OUTPUT_06");
+			expect(collapsed).not.toContain("KEPT_NATIVE_OUTPUT");
+			expect(collapsed).not.toContain("LAST_FIELD");
+		}
+		renderer.renderCall!(args, piTheme, { ...ctx, expanded: true });
+		renderer.renderResult!(delivered, { expanded: true, isPartial: false }, piTheme, { ...ctx, expanded: true });
+		const expanded = call.render(120).concat(output.render(120)).map(stripTerminalSequences).join("\n");
+		expect(expanded).toContain(failedSlot === "call" ? "FULL_INPUT_END" : "REAL_OUTPUT_15");
+		expect(expanded).toContain(failedSlot === "call" ? "LAST_FIELD" : "KEPT_NATIVE_INPUT_12");
+		expect(expanded).not.toContain("more lines");
+	});
+
+	it("keeps a delivered rich native result even when empty raw content provides no semantic Output fallback", () => {
+		const renderer = resolve("rich_details_only", {
+			renderCall: () => richChild("DETAILS_INPUT", 12),
+			renderResult: () => richChild("DETAILS_OUTPUT", 9),
+		});
+		const ctx = context({ args: {}, isPartial: false });
+		const call = renderer.renderCall!(ctx.args, piTheme, ctx);
+		const output = renderer.renderResult!({ content: [], details: { rows: 9 } },
+			{ expanded: false, isPartial: false }, piTheme, ctx);
+		const rendered = call.render(120).concat(output.render(120)).map(stripTerminalSequences).join("\n");
+		expect(rendered).not.toMatch(/├─+ Input ─/u);
+		expect(rendered).toMatch(/├─+ Output ─/u);
+		expect(rendered).toContain("DETAILS_INPUT_10");
+		expect(rendered).toContain("DETAILS_OUTPUT_05");
+		expect(rendered).not.toContain("DETAILS_OUTPUT_06");
+		expect(rendered).toContain("4 more lines");
+	});
+
+	it("restores exact native rows on global/per-name OFF and narrow fallback, then returns to the same styled card", async () => {
+		const card = richCard(richChild("RESTORED_INPUT", 12), richChild("RESTORED_OUTPUT", 9));
+		setToolRendererEnabled(false);
+		const nativeWide = card.rows();
+		const nativeNarrow = card.rows(4);
+		expect(nativeWide.map(stripTerminalSequences).join("\n")).toContain("RESTORED_INPUT_12");
+		expect(nativeWide.map(stripTerminalSequences).join("\n")).toContain("RESTORED_OUTPUT_09");
+		expect(nativeWide.map(stripTerminalSequences).join("\n")).not.toContain("╭");
+		setToolRendererEnabled(true);
+		const styled = card.rows();
+		expect(hasDivider(styled, "Input")).toBe(false);
+		expect(hasDivider(styled, "Output")).toBe(true);
+		expect(styled.map(stripTerminalSequences).join("\n")).toContain("2 more lines");
+		expect(card.rows(4)).toEqual(nativeNarrow);
+		setToolRendererEnabled(false);
+		expect(card.rows()).toEqual(nativeWide);
+		setToolRendererEnabled(true);
+		expect(card.rows()).toEqual(styled);
+		await saveSettings({ tools: { rich_extension: false } }, configPath);
+		invalidateToolPresentations("rich_extension");
+		expect(card.rows()).toEqual(nativeWide);
+		await saveSettings({ tools: { rich_extension: true } }, configPath);
+		invalidateToolPresentations("rich_extension");
+		expect(card.rows()).toEqual(styled);
+	});
+
+	it.each(["\u001b_Ga=T;DATA\u001b\\", "\u001b]1337;File=x:DATA\u0007", "\u001bPqDATA\u001b\\"])(
+		"lets native image rows escape unchanged before labels, hints and body clipping",
+		(image) => {
+			const callChild = richChild("IMAGE_INPUT", 12);
+			const resultChild = {
+				render: () => ["", image, "IMAGE_OUTPUT_LAST", ""],
+				invalidate() {},
+			};
+			const card = richCard(callChild, resultChild);
+			expect(card.call.render(120)).toEqual(callChild.render(116));
+			expect(card.output.render(120)).toEqual(resultChild.render());
+			expect(card.rows().map(stripTerminalSequences).join("\n")).not.toContain("more lines");
+			expect(card.rows().map(stripTerminalSequences).join("\n")).not.toContain("╭");
+			setToolRendererEnabled(false);
+			const native = card.rows();
+			setToolRendererEnabled(true);
+			card.rows();
+			setToolRendererEnabled(false);
+			expect(card.rows()).toEqual(native);
+		},
+	);
+
+	it("preserves unsupported rich self renderers exactly across ON/OFF instead of applying uniform section defaults", () => {
+		const callChild = richChild("SELF_INPUT", 12);
+		const resultChild = richChild("SELF_OUTPUT", 9);
+		const downstream: ToolRenderers = {
+			renderShell: "self",
+			renderCall: () => callChild,
+			renderResult: () => resultChild,
+		};
+		const renderer = resolve("unsupported_rich_self", downstream, [info("unsupported_rich_self", "/self.ts", "extension")]);
+		expect(renderer).toBe(downstream);
+		const ctx = context({ isPartial: false });
+		const call = renderer.renderCall!(ctx.args, piTheme, ctx);
+		const output = renderer.renderResult!(result, { expanded: false, isPartial: false }, piTheme, ctx);
+		const expected = callChild.render(120).concat(resultChild.render(120));
+		for (const enabled of [true, false, true]) {
+			setToolRendererEnabled(enabled);
+			expect(call.render(120).concat(output.render(120))).toEqual(expected);
+		}
 	});
 });

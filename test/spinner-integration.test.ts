@@ -13,7 +13,7 @@ import { createToolView, type ToolContext } from "../src/tool-presentation.ts";
 import { layoutToolView } from "../src/frame.ts";
 import { clearToolSpinners } from "../src/tool-spinner.ts";
 import { loadSettings, saveSettings, setIconMode } from "../src/settings.ts";
-import { Text, stripTerminalSequences, type Component } from "@earendil-works/pi-tui";
+import { Container, Text, stripTerminalSequences, type Component } from "@earendil-works/pi-tui";
 
 
 let configDirectory: string;
@@ -346,7 +346,9 @@ describe("prepared owned bodies through the real synchronous SDK invalidation", 
 		const info = { name, sourceInfo: { source: "builtin", path: `builtin:${name}` } } as ToolInfo;
 		const renderer = createToolRendererResolver({ getAllTools: () => [info] }, session)(name, () => undefined)!;
 		const source = Array.from({ length: 2000 }, (_, i) => `BODY_${i} 漢 e\u0301`).join("\n");
-		const args: { command?: string; path?: string; content?: string } = name === "bash" ? { command: "printf BODY | sed -n 1p" } : { path: name === "read" ? "/tmp/body.ts" : "/tmp/body.txt", content: source };
+		const args: { command?: string; path?: string; content?: string } = name === "bash"
+			? { command: "printf BODY | sed -n 1p" }
+			: name === "read" ? { path: "/tmp/body.ts" } : { path: "/tmp/body.txt", content: source };
 		const targetUi = { requestRender: vi.fn() };
 		const component = new ToolExecutionComponent(name, `long-${name}`, args, {}, renderer, targetUi as never, process.cwd());
 		component.markExecutionStarted();
@@ -357,6 +359,9 @@ describe("prepared owned bodies through the real synchronous SDK invalidation", 
 		const before = component.render(80).map(stripTerminalSequences);
 		expect(before.join("\n")).toContain("BODY_0");
 		expect(before.join("\n")).toContain("BODY_1999");
+		expect(before.join("\n")).not.toContain("Command");
+		expect(before.join("\n")).not.toContain("Input");
+		if (name !== "write") expect(before.join("\n")).toContain("Output");
 		const prepared = layouts.at(-1)!;
 		const callRows = prepared.callRows;
 		const resultRows = prepared.resultRows;
@@ -502,20 +507,30 @@ describe("prepared owned bodies through the real synchronous SDK invalidation", 
 		session.shutdown();
 	});
 
-	for (const kind of ["generic", "interactive"] as const) it(`keeps ${kind} callbacks and time-sensitive child invalidation on the ordinary path`, () => {
-		const child: Component = {
+	for (const kind of ["generic", "interactive", "custom-render", "custom-invalidate", "nested-render", "nested-invalidate"] as const) it(`keeps ${kind} callbacks and time-sensitive child invalidation on the ordinary path`, () => {
+		const child: Component = kind === "generic" || kind === "interactive" ? {
 			render: () => [`OPAQUE_TIME_${Date.now()}`],
 			invalidate: vi.fn(),
 			...(kind === "interactive" ? { handleInput: vi.fn() } : {}),
-		};
+		} : new Text(`OPAQUE_TIME_${Date.now()}`, 0, 0);
+		if (kind.endsWith("-render")) child.render = () => [`OPAQUE_TIME_${Date.now()}`];
+		if (kind.endsWith("-invalidate")) child.invalidate = vi.fn(() => {
+			(child as Text).setText(`OPAQUE_TIME_${Date.now()}`);
+		});
+		let nativeRoot = child;
+		if (kind.startsWith("nested-")) {
+			const container = new Container();
+			container.addChild(child);
+			nativeRoot = container;
+		}
 		const factory = vi.fn((...args: Parameters<typeof createToolView>) => {
 			const view = createToolView(...args);
 			return kind === "interactive" ? { ...view, sections: [{ component: child, slot: "result" as const }] } : view;
 		});
 		setToolRendererImplementation({ createToolView: factory, layoutToolView });
-		const name = kind === "generic" ? "opaque" : "read";
-		const downstream = { renderCall: vi.fn(() => child) };
-		const info = { name, sourceInfo: { source: kind === "generic" ? "extension" : "builtin", path: kind === "generic" ? "/opaque.ts" : "builtin:read" } } as ToolInfo;
+		const name = kind === "interactive" ? "read" : "opaque";
+		const downstream = { renderCall: vi.fn(() => nativeRoot) };
+		const info = { name, sourceInfo: { source: kind === "interactive" ? "builtin" : "extension", path: kind === "interactive" ? "builtin:read" : "/opaque.ts" } } as ToolInfo;
 		const session = trackedSession();
 		const renderer = createToolRendererResolver({ getAllTools: () => [info] }, session)(name, () => downstream)!;
 		const component = new ToolExecutionComponent(name, `live-${kind}`, { path: "/tmp/opaque.txt" }, {}, renderer, { requestRender: vi.fn() } as never, process.cwd());
@@ -530,8 +545,8 @@ describe("prepared owned bodies through the real synchronous SDK invalidation", 
 		expect(after).toContain(`OPAQUE_TIME_${Date.now()}`);
 		expect(after).not.toBe(before);
 		expect(factory.mock.calls.length).toBeGreaterThan(factoryCount);
-		if (kind === "generic") {
-			expect(child.invalidate).toHaveBeenCalled();
+		if (kind !== "interactive") {
+			if (vi.isMockFunction(child.invalidate)) expect(child.invalidate).toHaveBeenCalled();
 			expect(downstream.renderCall.mock.calls.length).toBeGreaterThan(callbackCount);
 		}
 		session.shutdown();

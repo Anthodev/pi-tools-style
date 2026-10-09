@@ -1,9 +1,9 @@
 import { keyHint, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import {
-	stripTerminalSequences,
+	Container,
+	Text,
 	truncateToWidth,
 	visibleWidth,
-	Text,
 	wrapTextWithAnsi,
 	type Component,
 } from "@earendil-works/pi-tui";
@@ -23,6 +23,11 @@ const SIXEL_SEQUENCE = /(?:\u001bP|\u0090)[0-9;]*q/u;
 // SDK wrapping can retain a grapheme wider than its width. These are the branches
 // that can exceed the usual one/two-cell base width in Pi's graphemeWidth.
 const DEFENSIVE_PADDED_ROW = /[\t\r\n\p{Mark}\uFF00-\uFFEF\u0E33\u0EB3]/u;
+const TEXT_RENDER = Text.prototype.render;
+const TEXT_INVALIDATE = Text.prototype.invalidate;
+const CONTAINER_RENDER = Container.prototype.render;
+const CONTAINER_INVALIDATE = Container.prototype.invalidate;
+const CONTAINER_HANDLE_MOUSE = Container.prototype.handleMouse;
 
 
 export function containsTerminalImage(lines: readonly string[]): boolean {
@@ -30,6 +35,27 @@ export function containsTerminalImage(lines: readonly string[]): boolean {
 		TERMINAL_IMAGE_SEQUENCES.some((sequence) => line.includes(sequence))
 			|| SIXEL_SEQUENCE.test(line),
 	);
+}
+
+/** Public Container handlers only forward; opaque or overridden handlers own interaction. */
+export function isInteractiveToolComponent(component: Component): boolean {
+	if (typeof component.handleInput === "function") return true;
+	if (component instanceof Container && component.handleMouse === CONTAINER_HANDLE_MOUSE) {
+		return component.children.some(isInteractiveToolComponent);
+	}
+	return typeof component.handleMouse === "function";
+}
+
+/** Only public static bodies can skip a generic renderer's ordinary clock invalidation. */
+export function hasStableToolBody(component: Component): boolean {
+	if (component instanceof Text) {
+		return component.render === TEXT_RENDER && component.invalidate === TEXT_INVALIDATE;
+	}
+	if (component instanceof Container) {
+		return component.render === CONTAINER_RENDER && component.invalidate === CONTAINER_INVALIDATE
+			&& component.children.every(hasStableToolBody);
+	}
+	return false;
 }
 
 interface RenderedSection {
@@ -154,36 +180,24 @@ export function layoutToolView(
 	}
 	const preparedHeader = serializeHeader(headerText);
 	layout.callRows.push(preparedHeader);
-	if (snapshot.presentation !== "generic" && !view.sections.some(({ component }) =>
-		typeof component.handleMouse === "function" || typeof component.handleInput === "function",
-	)) {
+	if (!view.sections.some(({ component }) => isInteractiveToolComponent(component)
+		|| (snapshot.presentation === "generic" && !hasStableToolBody(component)))) {
 		const refreshText = header.refreshText;
 		layout.refreshHeader = refreshText
 			? (frameIndex) => { layout.callRows[0] = serializeHeader(refreshText(frameIndex)); }
 			: () => { layout.callRows[0] = preparedHeader; };
-	}
-	if (header.fullTarget) {
-		const section: ToolSection = {
-			label: /^(?:bash|powershell|shell)$/iu.test(stripTerminalSequences(view.head.title)) ? "Command" : "Target",
-			slot: "call",
-			preview: false,
-			renderedWidth: "padded",
-			component: new Text(view.head.target, 0, 0),
-		};
-		sections.unshift({ section, rows: section.component.render(childWidth) });
 	}
 	for (const slot of ["call", "result"] as const) {
 		const output = slot === "call" || !hasResult ? layout.callRows : layout.resultRows;
 		const bounds = slot === "call" || !hasResult ? callBounds : resultBounds;
 		for (const entry of sections) {
 			if (entry.section.slot !== slot || entry.rows.length === 0) continue;
-			const interactive = typeof entry.section.component.handleMouse === "function"
-				|| typeof entry.section.component.handleInput === "function";
+			const interactive = isInteractiveToolComponent(entry.section.component);
 			let content: readonly string[] = entry.rows;
-			let padded = entry.section.renderedWidth === "padded" && snapshot.presentation !== "generic" && !interactive;
+			let padded = entry.section.renderedWidth === "padded" && !interactive;
 			let hidden = 0;
-			const preview = snapshot.presentation !== "generic" && !view.expanded && entry.section.preview !== false && !interactive
-				? view.preview : undefined;
+			const preview = !view.expanded && entry.section.preview !== false && !interactive
+				? entry.section.previewPolicy ?? view.preview : undefined;
 			if (preview?.unit === "entries") {
 				padded = false;
 				const entries = (entry.section.component as Partial<EntryLinesComponent>).entryLines;
@@ -192,7 +206,7 @@ export function layoutToolView(
 				hidden = Math.max(0, entries.length - count);
 				const selected = preview.edge === "tail" ? entries.slice(hidden) : entries.slice(0, count);
 				content = selected.flatMap((line) => wrapTextWithAnsi(line, childWidth));
-			} else if (snapshot.presentation !== "generic" && !interactive) {
+			} else if (!interactive) {
 				if (padded) {
 					let wrapped: string[] | undefined;
 					for (let index = 0; index < entry.rows.length; index++) {
@@ -220,8 +234,13 @@ export function layoutToolView(
 				}
 			}
 			if (content.length === 0 && hidden === 0) continue;
-			if (entry.section.label) {
-				const label = theme.fg("muted", entry.section.label);
+			// The semantic Input/Command label stays on the call section for producers and tests;
+			// the rendered card shows the supplied body directly, with no Input or Command divider.
+			const labelText = slot === "call" && (entry.section.label === "Input" || entry.section.label === "Command")
+				? undefined
+				: entry.section.label;
+			if (labelText) {
+				const label = theme.fg("muted", labelText);
 				output.push(framed ? bar("├", "┤", label) : body(truncateToWidth(label, childWidth, "…")));
 			}
 			if (content.length > 0) {
@@ -261,8 +280,9 @@ function semanticHeader(view: ToolView, snapshot: ToolSnapshot, theme: Theme, co
 		? theme.fg("dim", duration < 1000 ? `${Math.round(duration)}ms` : `${(duration / 1000).toFixed(1)}s`) : "";
 	const ending = [state, timing].filter(Boolean).join(" · ");
 	const endingWidth = visibleWidth(ending);
-	// Keep a target summary visible even when a long title or metadata competes with it.
-	const targetReserve = view.head.target ? Math.min(16, Math.floor(width / 3)) : 0;
+	const target = view.head.target;
+	// Reserve room for the callable identity even when title or metadata competes with it.
+	const targetReserve = target ? Math.min(16, Math.floor(width / 3)) : 0;
 	const titleBudget = Math.max(0, width - endingWidth - 3 - targetReserve - (targetReserve ? 1 : 0));
 	const title = theme.bold(theme.fg("toolTitle", truncateToWidth(formatToolTitle(view.head.title, mode), titleBudget, "…")));
 	const metaBudget = Math.max(0, width - visibleWidth(title) - endingWidth - 6 - targetReserve - (targetReserve ? 1 : 0));
@@ -270,11 +290,9 @@ function semanticHeader(view: ToolView, snapshot: ToolSnapshot, theme: Theme, co
 	const meta = metaBudget > 0 && rawMeta ? theme.fg("dim", truncateToWidth(rawMeta, metaBudget, "…")) : "";
 	const fixed = [title, meta, ending].filter(Boolean).join(" · ");
 	const targetBudget = Math.max(0, width - visibleWidth(fixed) - 1);
-	const target = view.head.target;
 	const multiline = target.includes("\n") || target.includes("\r");
-	const fullTarget = view.expanded && Boolean(target) && (multiline || visibleWidth(target) > targetBudget);
 	const summary = target.split(/\r?\n/u)[0] ?? "";
-	const visibleTarget = !fullTarget && targetBudget > 0 && target
+	const visibleTarget = targetBudget > 0 && target
 		? theme.fg("toolOutput", truncateToWidth(summary + (multiline ? " …" : ""), targetBudget, "…")) : "";
 	const first = [title, visibleTarget].filter(Boolean).join(" ");
 	const prefix = [first, meta].filter(Boolean).join(" · ");
@@ -284,7 +302,6 @@ function semanticHeader(view: ToolView, snapshot: ToolSnapshot, theme: Theme, co
 	return {
 		text,
 		width: visibleWidth(text),
-		fullTarget,
 		// A running glyph is the last visible cell. If truncation removed it, the
 		// prepared header is static; otherwise its one-cell budget never changes.
 		...(status === "running" && mode !== "off" && visibleWidth(rawText) <= width

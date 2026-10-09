@@ -2,16 +2,10 @@
 
 <p align="center"><strong>Give Pi tool activity clear, theme-aware structure without changing how tools run.</strong></p>
 
-<p align="center">
-  <a href="https://github.com/Anthodev/pi-tools-style/actions/workflows/ci.yml?query=branch%3Adevelop"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/Anthodev/pi-tools-style/ci.yml?branch=develop&amp;style=for-the-badge&amp;label=tests&amp;labelColor=101418"></a>
-  <a href="https://github.com/Anthodev/pi-tools-style/releases/latest"><img alt="Latest stable release" src="https://img.shields.io/github/v/release/Anthodev/pi-tools-style?style=for-the-badge&amp;label=release&amp;labelColor=101418&amp;color=9ccbfb"></a>
-  <a href="https://github.com/Anthodev/pi-tools-style/blob/develop/LICENSE"><img alt="MIT License" src="https://img.shields.io/github/license/Anthodev/pi-tools-style?style=for-the-badge&amp;labelColor=101418&amp;color=b9c8da"></a>
-</p>
-
 > [!NOTE]
-> The published npm `0.1.4` release still targets Pi `1.0.x` with the previous private-renderer approach. The Pi `1.1.x` middleware support, semantic cards, and MCP and web-search views described on this page exist in this repository's checkout and will ship with the next release. Until then, install this checkout locally to use them.
+> The published npm `0.1.4` release still targets Pi `1.0.x` with the previous private-renderer approach. The Pi `1.1.x` middleware support, semantic cards, and MCP, web-search, and execution views described on this page exist in this repository's checkout and will ship with the next release. Until then, install this checkout locally to use them.
 
-`pi-tools-style` gives Pi tool calls and direct shell commands clear semantic structure: status, duration, and target in a card head, bounded previews that expand in place with `Ctrl+O`, and colors that follow the active theme. It draws through Pi's public tool-renderer middleware and never registers or replaces a tool.
+`pi-tools-style` gives Pi tool calls and direct shell commands clear semantic structure: status, duration, and identity in a card head, command and content in framed sections, bounded previews that expand in place with `Ctrl+O`, and colors that follow the active theme. It draws through Pi's public tool-renderer middleware and never registers or replaces a tool.
 
 Built-in tools, MCP servers, and third-party extensions keep control of their schemas, permissions, prompts, execution backends, and content. Cards show only the data a result already contains; outputs that cannot be framed safely pass through untouched.
 
@@ -48,43 +42,44 @@ Pi stores the package in user settings and references the directory directly, so
 
 ## What it looks like
 
-Cards stay collapsed to a bounded preview and expand in place with `Ctrl+O`. The following captures are taken directly from a Pi `1.1` session at a 120-column terminal. A `bash` call renders as a framed card with a command head, an `Output` section, a completion mark, and a duration:
+Cards stay collapsed to a bounded preview and expand in place with `Ctrl+O`. The following frames are captured verbatim from provider-free offline replays at a 120-column terminal; they prove rendering, not filesystem execution. A `bash` call renders as a framed card with the tool's identity, state, and duration in the head, the supplied command directly below the head above an `Output` section, and a completion mark (shown expanded with `Ctrl+O`):
 
 ```text
-╭─── [$] | Bash $ printf 'L%02d\n' $(seq 1 12) · ok · 1.3s ────────────────────────────────────────────────────────────╮
+╭─── [$] | Bash · ok ──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ $ echo "First command line"                                                                                          │
+│ echo "Second command line"                                                                                           │
+│ timeout: 10s                                                                                                         │
 ├─── Output ───────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ L03                                                                                                                  │
-│ L04                                                                                                                  │
-│ L05                                                                                                                  │
-│ L06                                                                                                                  │
-│ L07                                                                                                                  │
-│ L08                                                                                                                  │
-│ L09                                                                                                                  │
-│ L10                                                                                                                  │
-│ L11                                                                                                                  │
-│ L12                                                                                                                  │
+│ First command line                                                                                                   │
+│ Second command line                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+The head never repeats the command; `Ctrl+O` reveals any remaining command lines above the same `Output`, with no `Command` divider row.
+
+A `read` call renders as a framed card too: the supplied path sits directly under the head, above the previewed `Output`:
+
+```text
+╭─── [F] | Read · ok ──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ path: /offline/InputLiteralPath.txt                                                                                  │
+├─── Output ───────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ O01                                                                                                                  │
+│ O02                                                                                                                  │
+│ O03                                                                                                                  │
+│ O04                                                                                                                  │
+│ O05                                                                                                                  │
+│ O06                                                                                                                  │
+│ O07                                                                                                                  │
+│ O08                                                                                                                  │
+│ O09                                                                                                                  │
+│ O10                                                                                                                  │
 │ … 2 more lines ctrl+o to expand                                                                                      │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
-A `read` call renders inline, with the path in the head and the preview underneath:
+`find`, `grep`, and `ls` follow the same shape: their supplied path, pattern, and options render the same way, above their `Output`.
 
-```text
- [F] | Read read-12.txt · ok
- L01
- L02
- L03
- L04
- L05
- L06
- L07
- L08
- L09
- L10
- … 2 more lines ctrl+o to expand
-```
-
-Direct `!` and `!!` commands keep their frame and `shell` title through a guarded internal adapter described under [How it works](#how-it-works). An interrupted command renders an explicit cancelled state rather than an error. Slash-command output remains unchanged because Pi does not expose one uniform transcript component for slash commands.
+Direct `!` and `!!` commands keep their frame and `shell` title through a guarded internal adapter described under [How it works](#how-it-works), and place the command body directly below the head above `Output` like tool cards. An interrupted command renders an explicit cancelled state rather than an error. Slash-command output remains unchanged because Pi does not expose one uniform transcript component for slash commands.
 
 ## Usage
 
@@ -103,7 +98,7 @@ Boxes start enabled. Manage them from Pi with:
 
 `/tools-style` toggles framing. `/tstyle` is a short alias with the same arguments. The explicit `on` and `off` forms set the desired state without depending on its current value. Turning boxes off restores Pi's native rendering for downstream renderers, backgrounds, and padding.
 
-`/tools-style config` opens an interactive menu (interactive TUI sessions only) listing the global switch, the icon mode, the shell card switch, and one row per known tool — the eight native tools, MCP calls, and third-party tools. Fuzzy search filters the rows; `Enter` or `Space` flips the selected value; `Escape` closes. Per-tool rows store explicit preferences for that exact tool name (absent means follow the global switch); already-rendered rows restyle immediately and every choice persists across restarts and `/reload`. The shell card has its own switch, so `!/!!` styling can be turned off without touching tool calls.
+`/tools-style config` opens an interactive menu (interactive TUI sessions only) listing the global switch, the icon mode, the shell card switch, and one row per known tool — the eight native tools, MCP calls, third-party tools, and the owned execution tools. Fuzzy search filters the rows; `Enter` or `Space` flips the selected value; `Escape` closes. Per-tool rows store explicit preferences for that exact tool name (absent means follow the global switch); already-rendered rows restyle immediately and every choice persists across restarts and `/reload`. The shell card has its own switch, so `!/!!` styling can be turned off without touching tool calls.
 
 ## Settings
 
@@ -161,25 +156,30 @@ Direct `!` and `!!` shell cards use the same state-based border and background s
 
 ## Tool presentations
 
-Built-in tools render either as a framed card or inline:
+The plugin renders these tool-specific cards:
+
+Supplied call arguments render directly under the head without an `Input` or `Command` divider. Other section dividers, including `Output`, `Diff`, and `Calls`, are unchanged.
 
 | Tool | Card |
 | --- | --- |
-| `bash`, `powershell` | Framed: command in the head, `Output` preview of the last lines, truncation note, `Full output: <path>` when Pi wrote one |
-| `edit`, `write` | Framed: target in the head, bounded content preview |
-| `read` | Inline: path and `:start-end` range in the head, syntax-highlighted or Markdown-aware preview |
-| `find`, `grep`, `ls` | Inline: entry previews with expand hints |
-| MCP calls | Framed: proven identity head, arguments, output, declared hints |
-| MCP resources | Framed cards for resource list, read, and templates |
-| Web search | Framed when the result arrives; inline while running |
+| `bash`, `powershell` | Framed: identity, state, and duration in the head; the command (first line, supplied options such as `timeout`) directly below the head above `Output` (last ten lines), truncation note, `Full output: <path>` when Pi wrote one |
+| `edit` | Framed: path and the request, kept when the result arrives, above the final `Diff` or error |
+| `write` | Framed: path and content preview above the actual result `Output`; an empty result shows no fabricated confirmation |
+| `read` | Framed: path and any supplied offset or limit above the `Output` preview |
+| `find`, `grep`, `ls` | Framed: supplied pattern, path, and options above the `Output` entries with an expand hint |
+| `ctx_execute`, `ctx_execute_file` | Framed: path, language, code, and options above the `Output` text |
+| `codemode` | Framed: JavaScript, model `Calls`, optional cost total, `Output`, `Full output: <path>` |
+| MCP calls | Framed: proven identity and declared hints in the head, supplied arguments above the `Output` |
+| MCP resources | Framed: resource title in the head, supplied server and URI arguments above the `Output` |
+| Web search | Framed in every state: query and supplied options above the answer, sources, or raw response |
 
-Every card shows its target once in the head and collapses previews behind a `… N more lines` or `… N more entries` hint. Output paths are displayed but never read.
+Every card shows its target once — in the head or directly below it — and collapses previews behind a `… N more lines` or `… N more entries` hint. Output paths are displayed but never read.
 
 ### MCP cards
 
 - A tool is treated as proven MCP only when Pi's public tool info reports `builtin:mcp`. An `mcp__*` name or reserved resource name that Pi has not proven is treated as an unresolved MCP call and still gets the MCP card, unless a downstream renderer already draws its own complete shell, in which case it passes through untouched; provenance is re-checked against Pi's tool list on render.
-- The head shows `server/tool` when the result details prove both, or `namespace/tool` when a proven namespace prefixes the exposed name; otherwise it falls back to the exposed tool name. A meta line shows the namespace when it is not already in the head, the exposure form when it is not direct, and annotation hints exactly as the server declares them (read-only, destructive, idempotent, open-world). Declared hints are shown, not verified.
-- Resource tools get their own cards with server and URI targets, including an all-servers view.
+- The head keeps only the callable identity: `server/tool` when the result details prove both, or `namespace/tool` when a proven namespace prefixes the exposed name; otherwise it falls back to the exposed tool name. A meta line shows the namespace when it is not already in the head, the exposure form when it is not direct, and annotation hints exactly as the server declares them (read-only, destructive, idempotent, open-world). Declared hints are shown, not verified. Supplied arguments are never merged into the head; the complete arguments render directly under the head.
+- Resource tools get their own cards. The head shows the resource title only; supplied arguments render as delivered (schemaless safe JSON) directly under the head, where `…` marks a value that has not arrived rather than a validated required field, and empty arguments are shown literally.
 
 ### Web-search cards
 
@@ -188,11 +188,19 @@ Every card shows its target once in the head and collapses previews behind a `�
 - Unstructured results keep a six-line text preview instead of a source tree.
 - MCP and web-search rendering is verified offline against recorded tool info and results. The extension does not contact servers or providers and makes no transport or quality promise.
 
+### Execution cards
+
+- Ownership follows the exact requested tool name and is case-sensitive: `codemode`, or any name starting with `ctx_execute` (`ctx_execute`, `ctx_execute_file`, and a future `ctx_execute*` suffix). `ctx_batch_execute`, `mcp__server__ctx_execute`, and other casings are not owned. The match needs no provenance, so these names get execution cards even when Pi reports none, and the web exception refuses them even if configured in `webSearchTools`.
+- `ctx_execute` and `ctx_execute_file` show their metadata (path for the file form, language for both), the code, and the remaining options — `timeout` in milliseconds, `background`, `cwd`, `intent` — directly under the head, above `Output`. The path is displayed, never read. The server's own input echo is dropped only on an exact match, so a result that does not match the arguments stays intact; codemode's `Script completed`/`Script failed` wrapper is likewise dropped only when it matches exactly.
+- Collapsed previews are independent: the code keeps the first ten visual lines, `Output` the first five. `Ctrl+O` expands the full content.
+- `codemode` shows its JavaScript directly under the head, each model call (name, arguments, status, duration, cost) in a `Calls` section that keeps the last eight entries behind a `… N more entries` hint and prints full errors when expanded, a `Model calls: $…` total when more than one call has a positive cost, the `Output`, and a `Full output: <path>` reference. A partial result shows only the calls already reported and no output.
+- Turning cards off, a presentation failure, or a width below the card minimum restores the captured native renderer for these tools.
+
 ## How it works
 
 Pi `1.1` exposes a public render middleware: extensions call `pi.registerToolRenderer()`, and the registered resolvers run in extension load order. `pi-tools-style` registers one resolver that receives `next()` — the downstream remainder of the resolver chain — and draws its own card around the renderer that `next()` returns, capturing that renderer's call and result fragments.
 
-Ordering decides the outcome. An earlier registered authoritative non-web renderer wins outright and this plugin is never consulted; a web provider registered after it is intercepted by the web exception, while a web renderer registered before it must delegate web calls through `next()` for that exception to apply. A resolver sees only the renderer handed to it through `next()`, cannot tell which extension produced it, and cannot reorder the chain. Generic third-party renderers are preserved — drawn inside the card, or passed through untouched when they already draw their own complete shell — whereas builtin, MCP, and recognized web renderers are replaced by these cards while styling is on and restored to Pi's native rendering when it is turned off.
+Ordering decides the outcome. An earlier registered authoritative non-web renderer wins outright and this plugin is never consulted; a web provider registered after it is intercepted by the web exception, while a web renderer registered before it must delegate web calls through `next()` for that exception to apply. A resolver sees only the renderer handed to it through `next()`, cannot tell which extension produced it, and cannot reorder the chain. Generic third-party renderers are preserved — drawn inside the card, or passed through untouched when they already draw their own complete shell — whereas builtin, MCP, recognized web, and owned execution renderers are replaced by these cards while styling is on and restored to Pi's native rendering when it is turned off. Execution ownership is matched by the exact requested name and is checked first, so those names never take the generic self-shell passthrough and are never promoted to web cards.
 
 Direct `!` and `!!` shell commands are not covered by that middleware. They keep a narrow internal decorator on the shell component, guarded so that any incompatible Pi internal change disables only shell framing and reports `Shell styling unavailable: incompatible Pi renderer internals.` The public tool cards keep working.
 
@@ -200,7 +208,8 @@ Turning cards off restores Pi's native rendering. Decoration errors fail open to
 
 ### Rendering and cache boundaries
 
-- **Header-only animation** — Owned tool cards refresh their prepared running header without rebuilding or rendering the body again. Direct-shell cards reuse Pi's existing loader cadence; generic and interactive renderers retain their ordinary redraw behavior.
+- **Header-only animation** — Owned tool cards refresh their prepared running header without rebuilding or rendering the body again. Direct-shell cards reuse Pi's existing loader cadence. For generic renderers, only a known static `Text`/`Container` tree whose descendants are all static and passive qualifies for the header-only transaction; an opaque or custom-render component keeps the ordinary SDK invalidation path so implicit dynamic rendering stays live. This does not make every generic card cost-free.
+- **Generic cards** — A third-party renderer that does not draw its own complete shell is drawn inside the card: its real call component renders directly under the head (first ten visual lines) and its real result component becomes `Output` (first five), falling back to the safe supplied arguments or extracted text only when the renderer returns no usable component. Interactive components are never sliced, while a noninteractive sibling still keeps its own preview and hint.
 - **Bounded preparation** — Each row retains one current primary body and one current-width layout. Unchanged text, Markdown, and syntax highlighting are reused; ordinary callbacks still re-read arguments and results, including objects mutated in place. Real component or environment invalidation clears derived preparation, while width-only changes relayout the retained view.
 - **Exact previews** — Previews remain bounded after wrapping. Unusual Unicode clusters keep defensive width checks, and fresh large payloads still require full-context highlighting and wrapping. This reduces renderer CPU work, not all terminal painting or input latency.
 
@@ -213,7 +222,7 @@ Turning cards off restores Pi's native rendering. Decoration errors fail open to
 - Windows runtime behavior is untested; the Windows-specific path test is skipped on other platforms.
 - Kitty, iTerm2, and Sixel image output remains unboxed by design.
 - Slash commands remain outside the current scope because their transcript output has no uniform component.
-- Unsupported renderer shapes fail open rather than affecting tool execution.
+- A card that cannot be framed safely — turned off globally or per name, narrower than the card minimum, a presentation or construction failure, or an unsupported renderer shape — falls back to the captured native rendering rather than affecting tool execution. A downstream renderer that already draws its own complete shell, and terminal-image output, pass through untouched.
 - Frame characters remain selectable text and are included in copied output. Excluding decorative cells would require Pi/TUI integration for fullscreen selection; no portable exclusion path has been identified for native terminal selection in regular mode.
 
 ## Development
@@ -226,7 +235,9 @@ npm run check
 npm pack --dry-run --json
 ```
 
-`npm run check` runs TypeScript validation and the Vitest suite. Tests cover the builtin, MCP, and web-search semantic views against recorded results, frame layout and ANSI width parity, native restoration when cards are disabled, the public middleware resolver and its self-shell exception, the guarded shell decorator, category colors, icon modes, persisted settings, spinner lifecycle, real Pi `1.1` component integration, reload idempotence, fail-open behavior, and the no-`registerTool()` contract.
+Pi selects which extension files a package contributes through that package's `pi.extensions` field (`index.ts` here); activating the working tree means adding the checkout path to Pi's `packages` setting in the user settings and restarting Pi. An already-loaded package picks up changes after `/reload`.
+
+`npm run check` runs TypeScript validation and the Vitest suite. Tests cover the builtin, MCP, web-search, and execution semantic views against recorded results, shell command placement and independent previews, frame layout and ANSI width parity, native restoration when cards are disabled, the public middleware resolver and its self-shell exception, the guarded shell decorator, category colors, icon modes, persisted settings, spinner lifecycle, real Pi `1.1` component integration, reload idempotence, fail-open behavior, and the no-`registerTool()` contract.
 
 Release-note tests cover exact version sections, Markdown fences and whitespace, duplicate or missing sections, tagged Git snapshots, annotated and lightweight tags, and CLI failure paths.
 

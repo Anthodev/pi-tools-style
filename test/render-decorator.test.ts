@@ -198,16 +198,36 @@ describe("shared semantic shell view", () => {
 		vi.advanceTimersByTime(800); expect(text(shell)).toBe(final);
 		expect(shell.getOutput()).toBe("STREAM_ONE\nSTREAM_TWO\n");
 	});
-	it("uses tail ten visual lines, keeps command expansion, and expands existing rows", () => {
+	it("uses tail ten visual lines, bounds the collapsed command independently, and expands existing rows", () => {
 		installShellRenderer(Shell); const shell = new Shell(); shell.status = "complete";
 		shell.command = "printf FIRST_COMMAND\nprintf SECOND_COMMAND";
 		shell.output = Array.from({ length: 16 }, (_, i) => `SHELL_LINE_${String(i + 1).padStart(2, "0")}`).join("\n");
 		const collapsed = text(shell);
+		expect(collapsed).not.toContain("Command");
+		expect(collapsed).toContain("FIRST_COMMAND");
+		expect(collapsed).not.toContain("SECOND_COMMAND");
+		expect(collapsed).toContain("1 more lines");
 		expect(collapsed).not.toContain("SHELL_LINE_01"); expect(collapsed).toContain("SHELL_LINE_07"); expect(collapsed).toContain("SHELL_LINE_16");
-		expect(collapsed).not.toContain("SECOND_COMMAND"); expect(collapsed).toContain("6 more lines");
+		expect(collapsed).toContain("6 more lines");
 		shell.expanded = true;
-		const expanded = text(shell); expect(expanded).toContain("SHELL_LINE_01"); expect(expanded).toContain("SECOND_COMMAND"); expect(expanded).toContain("Command");
+		const expanded = text(shell); expect(expanded).toContain("SHELL_LINE_01"); expect(expanded).toContain("SECOND_COMMAND"); expect(expanded).not.toContain("Command");
 		expect(shell.getOutput()).toBe(shell.output);
+	});
+	it("keeps the collapsed shell command body above output without a Command divider, never in the header", () => {
+		installShellRenderer(Shell); const shell = new Shell(); shell.status = "complete";
+		shell.command = "printf FIRST_COMMAND\nprintf SECOND_COMMAND";
+		shell.output = "SHELL_OUTPUT";
+		const rendered = shell.render(80).map(stripTerminalSequences);
+		const inputLine = rendered.findIndex((line) => line.includes("FIRST_COMMAND"));
+		const outputLine = rendered.findIndex((line) => line.includes("SHELL_OUTPUT"));
+		const header = rendered.find((line) => line.startsWith("╭"));
+		expect(header).toBeDefined();
+		expect(header).toContain("Shell");
+		expect(header).not.toContain("FIRST_COMMAND");
+		expect(inputLine).toBeGreaterThan(-1);
+		expect(outputLine).toBeGreaterThan(inputLine);
+		expect(rendered.join("\n")).not.toContain("Command");
+		expect(rendered.join("\n")).not.toContain("SECOND_COMMAND");
 	});
 	it("shows real nonzero exit code, distinct cancellation, and context exclusion", () => {
 		installShellRenderer(Shell); const shell = new Shell(); shell.output = "FAILURE_OUTPUT"; shell.status = "error"; shell.exitCode = 42;

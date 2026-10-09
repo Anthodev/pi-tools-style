@@ -166,6 +166,23 @@ describe("isWebSearchTool", () => {
 		}
 	});
 
+	it("reserves exact execution names and every ctx_execute suffix before configured or MCP web evidence", () => {
+		for (const name of ["ctx_execute", "ctx_execute_file", "ctx_execute_future", "ctx_executeFuture", "codemode"]) {
+			for (const metadata of [undefined, extensionInfo({ name }), mcpInfo({ name })]) {
+				expect(isWebSearchTool(name, metadata, { server: "context-web", tool: "web_search" }, [name])).toBe(false);
+				expect(isWebSearchTool(name, metadata, { server: "context-web", tool: "web_search" }, [])).toBe(false);
+			}
+		}
+	});
+
+	it("does not extend execution exclusion to batch, namespace or differently cased names", () => {
+		for (const name of ["ctx_batch_execute", "mcp__server__ctx_execute", "Codemode", "CTX_EXECUTE", "codemode_extra"]) {
+			expect(isWebSearchTool(name, extensionInfo({ name }), undefined, [])).toBe(false);
+			expect(isWebSearchTool(name, extensionInfo({ name }), undefined, [name])).toBe(true);
+			expect(isWebSearchTool(name, mcpInfo({ name }), { server: "context-web", tool: "web_search" }, [])).toBe(true);
+		}
+	});
+
 	it("treats an exact configured exposure as an explicit declaration", () => {
 		expect(isWebSearchTool("mcp__my_web__search", extensionInfo({ name: "mcp__my_web__search" }), undefined, ["mcp__my_web__search"])).toBe(true);
 	});
@@ -348,47 +365,125 @@ describe("readWebResponse", () => {
 });
 
 describe("createWebSearchView before a result", () => {
-	it("renders an inline card whose target is the streamed query", () => {
-		const view = webView({ args: { query: "Pi 1.1" }, context: context({ executionStarted: true }) });
-		expect(view.layout).toBe("inline");
+	it("renders a framed card whose query and options live in Input, never in the head", () => {
+		const view = webView({ args: { query: "Pi 1.1", limit: 5 }, context: context({ executionStarted: true }) });
+		expect(view.layout).toBe("framed");
 		expect(view.head.title).toBe("Web Search");
-		expect(view.head.target).toBe("Pi 1.1");
+		expect(view.head.target).toBe("");
 		expect(view.head.status).toBe("running");
+		const input = sectionWithLabel(view, "Input");
+		expect(input?.slot).toBe("call");
+		const body = renderSection(input);
+		expect(body).toContain("Pi 1.1");
+		expect(body).toContain("limit");
+		expect(body).toContain("5");
 	});
 
-	it("shows a pending target and keeps the other arguments without inventing a query", () => {
+	it("keeps the streamed query out of the framed header line", () => {
+		const snap = snapshot({ args: { query: "QUERY_HEADER_MARKER", limit: 5 } });
+		const header = frameRows(createWebSearchView("web_search", snap, theme), snap)[0] ?? "";
+		expect(header).toContain("Web Search");
+		expect(header).not.toContain("QUERY_HEADER_MARKER");
+	});
+
+	it("marks a query that has not streamed yet and still keeps every other option in Input", () => {
 		const view = webView({ args: { q: "hello" } });
-		expect(view.head.target).toBe("…");
-		expect(renderLabel(view, "Arguments")).toContain('q="hello"');
+		expect(view.head.target).toBe("");
+		const body = renderLabel(view, "Input");
+		expect(body).toContain("…");
+		expect(body).toContain("hello");
+		expect(sectionWithLabel(view, "Arguments")).toBeUndefined();
 	});
 
-	it("keeps the query out of the Arguments section", () => {
-		const view = webView({ args: { query: "Pi 1.1", limit: 5 } });
-		const argumentsBody = renderLabel(view, "Arguments");
-		expect(argumentsBody).toContain("limit=5");
-		expect(argumentsBody).not.toContain("query");
+	it("never pre-clips a long option at a hundred characters in Input", () => {
+		const long = "L".repeat(150);
+		const snap = snapshot({ args: { query: "Pi 1.1", extra: long } });
+		const view = createWebSearchView("web_search", snap, theme);
+		expect(renderLabel(view, "Input")).toContain(long);
+		expect(frameRows(view, snap).join("\n")).toContain(long);
 	});
 
-	it("normalises control characters in the streamed query", () => {
+	it("renders a framed card with an empty argument object as a literal marker instead of dropping Input", () => {
+		const view = webView({ args: {} });
+		expect(view.layout).toBe("framed");
+		const input = sectionWithLabel(view, "Input");
+		expect(input?.slot).toBe("call");
+		expect(renderSection(input)).toContain("{}");
+	});
+
+	it("marks arguments that have not arrived at all with a single pending Input", () => {
+		const snap = snapshot({ args: undefined, context: context({ args: undefined }) });
+		const view = createWebSearchView("web_search", snap, theme);
+		expect(view.layout).toBe("framed");
+		expect(view.head.target).toBe("");
+		expect(renderSection(sectionWithLabel(view, "Input")).trim()).toBe("…");
+	});
+
+	it("renders a non-object argument value literally", () => {
+		const array = snapshot({ args: [] });
+		expect(renderSection(sectionWithLabel(createWebSearchView("web_search", array, theme), "Input"))).toContain("[]");
+		const empty = snapshot({ args: null });
+		expect(renderSection(sectionWithLabel(createWebSearchView("web_search", empty, theme), "Input"))).toContain("null");
+	});
+
+	it("marks a malformed query argument while keeping the raw argument", () => {
+		const view = webView({ args: { query: 42, limit: 5 } });
+		expect(view.head.target).toBe("");
+		const body = renderLabel(view, "Input");
+		expect(body).toContain("[invalid arg]");
+		expect(body).toContain("42");
+	});
+
+	it("marks a null query property as an invalid argument instead of a pending overall input", () => {
+		const snap = snapshot({ args: { query: null, limit: 5 } });
+		const view = createWebSearchView("web_search", snap, theme);
+		const body = renderLabel(view, "Input");
+		expect(body).toContain("query: [invalid arg] (null)");
+		expect(body).toContain("limit");
+		expect(body).toContain("5");
+		expect(body).not.toContain("query: …");
+		// Consumer rendering through the frame keeps the delivered null literal.
+		expect(frameRows(view, snap).join("\n")).toContain("[invalid arg] (null)");
+
+		// The response-provided query stays its own result section, never supplied input.
+		const structured = snapshot({
+			args: { query: null, limit: 5 },
+			result: structuredResult({ searchQueries: ["RESULT_QUERY_MARKER"] }),
+		});
+		const structuredView = createWebSearchView("web_search", structured, theme);
+		const query = sectionWithLabel(structuredView, "Query");
+		expect(query?.slot).toBe("result");
+		expect(renderSection(query)).toContain("RESULT_QUERY_MARKER");
+		expect(renderLabel(structuredView, "Input")).not.toContain("RESULT_QUERY_MARKER");
+	});
+
+	it("normalises control characters in the streamed query inside Input", () => {
 		const view = webView({ args: { query: "Pi\u0000 1.1\u009b31m" } });
-		expect(view.head.target).not.toContain("\u0000");
-		expect(view.head.target).not.toContain("\u009b");
-		expect(view.head.target).toContain("\\x9B");
+		const body = renderLabel(view, "Input");
+		expect(body).not.toContain("\u0000");
+		expect(body).not.toContain("\u009b");
+		expect(body).toContain("\\x9B");
 	});
 
-	it("keeps a multiline query intact so the frame can move it into the target section", () => {
+	it("keeps a multiline query intact inside the Input section", () => {
 		const view = webView({ args: { query: "first line\nsecond line" }, context: context({ expanded: true }) });
-		expect(view.head.target).toBe("first line\nsecond line");
+		expect(view.head.target).toBe("");
+		const body = renderLabel(view, "Input");
+		expect(body).toContain("first line");
+		expect(body).toContain("second line");
 	});
 });
 
 describe("createWebSearchView structured result", () => {
-	it("shows the args query exactly once, in the head", () => {
+	it("shows the args query exactly once, in the framed Input, and never in the head", () => {
 		const view = webView({ args: { query: "Pi 1.1" }, result: structuredResult({ answer: "ANSWER_MARKER" }) });
 		expect(view.layout).toBe("framed");
-		expect(view.head.target).toBe("Pi 1.1");
+		expect(view.head.target).toBe("");
 		expect(sectionWithLabel(view, "Query")).toBeUndefined();
+		expect(renderLabel(view, "Input")).toContain("Pi 1.1");
 		expect(renderLabel(view, "Answer")).not.toContain("Pi 1.1");
+		// The rich labelled result sections are never wrapped in a redundant Output divider.
+		expect(sectionWithLabel(view, "Output")).toBeUndefined();
 	});
 
 	it("labels the source count and keeps eight rows collapsed with the extra hint", () => {
@@ -532,38 +627,44 @@ describe("createWebSearchView structured result", () => {
 		expect(renderSection(fullOutput)).toContain("Full output: /tmp/fixture-full.txt");
 	});
 
-	it("keeps a literal invalid-arg marker query as the provided query", () => {
+	it("keeps a literal invalid-arg marker query as the provided query in Input", () => {
 		const view = webView({
 			args: { query: "[invalid arg]" },
 			result: structuredResult({ searchQueries: ["RESULT_QUERY_MARKER"] }),
 		});
-		expect(view.head.target).toBe("[invalid arg]");
+		expect(view.head.target).toBe("");
+		expect(renderLabel(view, "Input")).toContain("[invalid arg]");
 		expect(sectionWithLabel(view, "Query")).toBeUndefined();
 	});
 
-	it("falls back to the response query when the args query is not a string", () => {
+	it("marks a non-string query as invalid while retaining its serialized value and the response fallback", () => {
 		const view = webView({ args: { query: 42, limit: 5 }, result: structuredResult({ searchQueries: ["RESULT_QUERY_MARKER"] }) });
-		expect(view.head.target).toBe("[invalid arg]");
+		expect(view.head.target).toBe("");
 		const query = sectionWithLabel(view, "Query");
 		expect(query?.slot).toBe("result");
 		expect(query?.preview).toBe(false);
 		expect(renderSection(query)).toContain("RESULT_QUERY_MARKER");
+		const input = renderLabel(view, "Input");
+		expect(input).toContain("[invalid arg]");
+		expect(input).toContain("42");
+		expect(input).toContain("limit");
 		// The unusable raw argument is still shown, and the fallback never leaks there.
-		const argumentsBody = renderLabel(view, "Arguments");
-		expect(argumentsBody).toContain("query=42");
-		expect(argumentsBody).not.toContain("RESULT_QUERY_MARKER");
+		expect(input).not.toContain("RESULT_QUERY_MARKER");
 	});
 
-	it("treats an empty provided query as a provided query", () => {
+	it("treats an empty provided query as a provided query and shows its escaped literal", () => {
 		const view = webView({ args: { query: "" }, result: structuredResult({ searchQueries: ["RESULT_QUERY_MARKER"] }) });
 		expect(view.head.target).toBe("");
 		expect(sectionWithLabel(view, "Query")).toBeUndefined();
+		const input = renderLabel(view, "Input");
+		expect(input).toContain('""');
+		expect(input).not.toContain("RESULT_QUERY_MARKER");
 	});
 
-	it("keeps only the call section outside the result slot", () => {
+	it("keeps only the Input section outside the result slot", () => {
 		const view = webView({ args: { query: "Pi 1.1", limit: 5 }, result: structuredResult({ answer: "ANSWER_MARKER" }) });
 		for (const section of view.sections) {
-			expect(section.slot).toBe(section.label === "Arguments" ? "call" : "result");
+			expect(section.slot).toBe(section.label === "Input" ? "call" : "result");
 		}
 	});
 
@@ -684,14 +785,16 @@ describe("createWebSearchView error results", () => {
 		expect(sectionWithLabel(view, "Sources · 10")).toBeUndefined();
 	});
 
-	it("never repeats an args query for an error result", () => {
+	it("keeps the args query only in Input for an error result", () => {
 		const view = webView({
 			args: { query: "Pi 1.1" },
 			result: structuredResult({ searchQueries: ["RESULT_QUERY_MARKER"] }, { error: "PROVIDER_FAILURE_MARKER" }),
 		});
-		expect(view.head.target).toBe("Pi 1.1");
+		expect(view.head.target).toBe("");
+		expect(renderLabel(view, "Input")).toContain("Pi 1.1");
 		expect(sectionWithLabel(view, "Query")).toBeUndefined();
 		expect(renderLabel(view, "Error")).toContain("PROVIDER_FAILURE_MARKER");
+		expect(renderLabel(view, "Error")).not.toContain("Pi 1.1");
 	});
 
 	it("uses the real result text for a flagged error", () => {
@@ -782,7 +885,7 @@ describe("createWebSearchView error results", () => {
 		expect(view.head.status).toBe("error");
 		expect(view.tone).toBe("error");
 		expect(sectionWithLabel(view, "Error")).toBeUndefined();
-		expect(view.sections).toEqual([]);
+		expect(view.sections.filter((section) => section.slot === "result")).toEqual([]);
 
 		// A provided full output is still preserved beside the empty error.
 		const withOutput = webView({
@@ -883,16 +986,18 @@ describe("createWebSearchView unstructured results", () => {
 		expect(view.head.status).toBe("done");
 	});
 
-	it("keeps the real query in the head", () => {
+	it("keeps the real query in Input and never in the head", () => {
 		const view = webView({ args: { query: "Pi 1.1" }, result: textResult("RAW_WEB_L01") });
-		expect(view.head.target).toBe("Pi 1.1");
+		expect(view.head.target).toBe("");
+		expect(renderLabel(view, "Input")).toContain("Pi 1.1");
 	});
 
-	it("shows the header and state only for empty text", () => {
+	it("shows the header, state and framed Input only for empty text", () => {
 		const view = webView({ result: textResult("   ") });
 		expect(sectionWithLabel(view, "Response")).toBeUndefined();
-		expect(view.sections).toEqual([]);
+		expect(view.sections.filter((section) => section.slot === "result")).toEqual([]);
 		expect(view.head.title).toBe("Web Search");
+		expect(view.layout).toBe("framed");
 	});
 
 	it("accepts a single-block OMP JSON response without structuredContent", () => {
@@ -966,12 +1071,80 @@ describe("createWebSearchView status and duration", () => {
 	it("stays pending for a partial revision that has no result yet", () => {
 		const view = webView({ context: context({ isPartial: true, argsComplete: false }) });
 		expect(view.head.status).toBe("pending");
-		expect(view.layout).toBe("inline");
+		expect(view.layout).toBe("framed");
 	});
 
 	it("runs once execution has started even before a result arrives", () => {
 		expect(webView({ context: context({ executionStarted: true }) }).head.status).toBe("running");
 		expect(webView({ context: context({ executionStarted: true, isPartial: true }) }).head.status).toBe("running");
+	});
+});
+
+/* -------------------------------------------------------------------------- */
+/* Framed states and independent previews                                     */
+/* -------------------------------------------------------------------------- */
+
+describe("createWebSearchView framed states", () => {
+	it("frames every web state: no result, running, error, structured and raw", () => {
+		expect(webView({ args: { query: "QUERY_MARKER" } }).layout).toBe("framed");
+		const running = webView({ args: { query: "QUERY_MARKER" }, context: context({ executionStarted: true }) });
+		expect(running.layout).toBe("framed");
+		expect(running.head.status).toBe("running");
+		const failed = webView({ result: textResult("BOOM_MARKER"), context: context({ isError: true }) });
+		expect(failed.layout).toBe("framed");
+		expect(failed.tone).toBe("error");
+		expect(webView({ result: structuredResult({ answer: "ANSWER_MARKER" }) }).layout).toBe("framed");
+		expect(webView({ result: textResult("RAW_WEB_L01") }).layout).toBe("framed");
+	});
+
+	it("places the framed Input above the result sections", () => {
+		const snap = snapshot({ args: { query: "QUERY_MARKER" }, result: structuredResult({ answer: "ANSWER_MARKER" }) });
+		const view = createWebSearchView("web_search", snap, theme);
+		const rows = frameRows(view, snap);
+		const inputRow = rows.findIndex((row) => row.includes("QUERY_MARKER"));
+		const answerRow = rows.findIndex((row) => row.includes("ANSWER_MARKER"));
+		expect(inputRow).toBeGreaterThan(-1);
+		expect(answerRow).toBeGreaterThan(inputRow);
+	});
+
+	it("bounds Input to ten visual lines on a structured result that has no result-level preview", () => {
+		const args: Record<string, unknown> = { query: "QUERY_MARKER" };
+		for (let index = 1; index <= 14; index++) {
+			args[`opt${index}`] = `INPUT_LINE_${index}`;
+		}
+		const snap = snapshot({ args, result: structuredResult({ answer: "ANSWER_MARKER" }) });
+		const view = createWebSearchView("web_search", snap, theme);
+		expect(view.preview).toBeUndefined();
+		expect(sectionWithLabel(view, "Input")?.previewPolicy).toEqual({ edge: "head", count: 10, unit: "visual-lines" });
+		const collapsed = frameRows(view, snap).join("\n");
+		expect(collapsed).toContain("INPUT_LINE_1");
+		expect(collapsed).not.toContain("INPUT_LINE_14");
+		expect(collapsed).toMatch(/\d+ more lines/u);
+		expect(renderLabel(view, "Answer")).toContain("ANSWER_MARKER");
+		expect(sectionWithLabel(view, "Sources · 10")).toBeDefined();
+
+		const expandedSnap = snapshot({ args, result: structuredResult({ answer: "ANSWER_MARKER" }), context: context({ expanded: true }) });
+		const expanded = frameRows(createWebSearchView("web_search", expandedSnap, theme), expandedSnap).join("\n");
+		expect(expanded).toContain("INPUT_LINE_14");
+		expect(expanded).not.toContain("more lines");
+	});
+
+	it("bounds Input to ten lines independently of the six-line raw output", () => {
+		const args: Record<string, unknown> = { query: "QUERY_MARKER" };
+		for (let index = 1; index <= 14; index++) {
+			args[`opt${index}`] = `INPUT_LINE_${index}`;
+		}
+		const output = Array.from({ length: 12 }, (_, index) => `OUTPUT_LINE_${index + 1}`).join("\n");
+		const snap = snapshot({ args, result: textResult(output) });
+		const view = createWebSearchView("web_search", snap, theme);
+		expect(view.preview).toEqual({ edge: "head", count: 6, unit: "visual-lines" });
+		expect(sectionWithLabel(view, "Input")?.previewPolicy).toEqual({ edge: "head", count: 10, unit: "visual-lines" });
+		const collapsed = frameRows(view, snap).join("\n");
+		expect(collapsed).toContain("INPUT_LINE_1");
+		expect(collapsed).not.toContain("INPUT_LINE_14");
+		expect(collapsed).toContain("OUTPUT_LINE_1");
+		expect(collapsed).not.toContain("OUTPUT_LINE_12");
+		expect(collapsed.match(/\d+ more lines/gu)).toHaveLength(2);
 	});
 });
 
@@ -1037,9 +1210,11 @@ describe("owned web view reuse", () => {
 		const args: { query: string } = { query: "first query" };
 		const result = textResult("UNSTRUCTURED_BODY");
 
-		expect(webView({ args, context: context({ state }), result }).head.target).toBe("first query");
+		expect(renderLabel(webView({ args, context: context({ state }), result }), "Input")).toContain("first query");
 		args.query = "second query";
-		expect(webView({ args, context: context({ state }), result }).head.target).toBe("second query");
+		const revised = webView({ args, context: context({ state }), result });
+		expect(renderLabel(revised, "Input")).toContain("second query");
+		expect(renderLabel(revised, "Input")).not.toContain("first query");
 	});
 
 	it("drops the retained answer when the web cache is explicitly invalidated", () => {
@@ -1107,6 +1282,6 @@ describe("owned web view reuse", () => {
 		expect(sectionWithLabel(failed, "Error")?.renderedWidth).toBe("padded");
 
 		const pending = webView({ args: { query: "q", limit: 5 } });
-		expect(sectionWithLabel(pending, "Arguments")?.renderedWidth).toBe("padded");
+		expect(sectionWithLabel(pending, "Input")?.renderedWidth).toBe("padded");
 	});
 });

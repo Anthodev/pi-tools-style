@@ -22,8 +22,10 @@ import {
 import {
 	extractToolText,
 	invalidateToolViewCache,
+	isExecutionToolName,
 	normalizeDisplayText,
 	reuseToolSection,
+	type ToolPreview,
 	type ToolResult,
 	type ToolSection,
 	type ToolSnapshot,
@@ -38,7 +40,10 @@ import {
 const PENDING = "…";
 /** Shown in place of a target whose value was streamed but is not the expected string. */
 const INVALID_ARG = "[invalid arg]";
-const COLLAPSED_ARGS_CHARS = 100;
+/** The record key whose value leads the Input section and is never consumed into the head. */
+const QUERY_KEY = "query";
+/** Collapsed bound of the complete web Input record; expansion reveals all of it. */
+const INPUT_PREVIEW: ToolPreview = { edge: "head", count: 10, unit: "visual-lines" };
 /** Collapsed source rows before the `… N more sources` hint. */
 const COLLAPSED_SOURCES = 8;
 /** Unstructured response lines kept before expansion. */
@@ -156,6 +161,9 @@ export function isWebSearchTool(
 	details: unknown,
 	configuredNames: readonly string[],
 ): boolean {
+	if (isExecutionToolName(toolName)) {
+		return false;
+	}
 	if (Object.hasOwn(RESERVED_TOOL_NAMES, toolName)) {
 		return false;
 	}
@@ -602,42 +610,64 @@ function jsonText(value: unknown, pretty: boolean): string {
 	}
 }
 
-function argEntries(args: unknown): Array<[string, unknown]> {
-	if (args === undefined || args === null) {
-		return [];
+/**
+ * One supplied `query` value as the leading Input line: a real string is shown
+ * normalized, an empty or whitespace-only one as its escaped compact literal so
+ * it never disappears, and any other delivered value — including `null` — as the
+ * invalid marker plus the literal that was delivered. Only an absent value stays
+ * pending.
+ */
+function queryLine(value: unknown): string {
+	if (value === undefined) {
+		return `${QUERY_KEY}: ${PENDING}`;
 	}
-	if (typeof args === "object" && !Array.isArray(args)) {
-		return Object.entries(args as Record<string, unknown>);
+	if (typeof value === "string") {
+		const normalized = normalizeDisplayText(value);
+		return `${QUERY_KEY}: ${normalized.trim().length > 0 ? normalized : jsonText(value, false)}`;
 	}
-	return [["args", args]];
+	return `${QUERY_KEY}: ${INVALID_ARG} (${jsonText(value, false)})`;
 }
 
-function argumentsSection(args: unknown, expanded: boolean): ToolSection | undefined {
-	const entries = argEntries(args);
-	if (entries.length === 0) {
-		return undefined;
-	}
-	const lines: string[] = [];
-	if (expanded) {
-		lines.push(...normalizeDisplayText(jsonText(args, true)).split("\n"));
-	} else {
-		const pairs = entries.map(([key, value]) => `${key}=${jsonText(value, false)}`).join(" ");
-		const preview = pairs.length > COLLAPSED_ARGS_CHARS ? `${pairs.slice(0, COLLAPSED_ARGS_CHARS - 3)}...` : pairs;
-		lines.push(normalizeDisplayText(preview));
-	}
-	return textSection(lines, "call", true, "Arguments");
-}
-
-/** Drop the arguments already shown in the head so the query is never repeated. */
-function remainingArgs(args: unknown, consumed: readonly string[]): unknown {
-	if (consumed.length === 0) {
-		return args;
-	}
+/**
+ * The complete Input section of a web call, the only call section a web card
+ * owns. Nothing is consumed into the head, so the query is never dropped and a
+ * nonempty record without one states the pending query next to every other
+ * option. Absent args, empty records, arrays and primitives keep a visible
+ * literal instead of an omitted section, and each value is shown as delivered —
+ * no default, no hundred-character clipping, safe serialization only.
+ */
+function webInputSection(args: unknown): ToolSection {
+	let text: string;
 	const record = asRecord(args);
-	if (!record) {
-		return args;
+	if (args === undefined) {
+		text = PENDING;
+	} else if (!record) {
+		text = normalizeDisplayText(jsonText(args, false));
+	} else {
+		const entries = Object.entries(record);
+		if (entries.length === 0) {
+			text = "{}";
+		} else {
+			const lines: string[] = [];
+			const query = entries.find(([key]) => key === QUERY_KEY);
+			lines.push(...queryLine(query ? query[1] : undefined).split("\n"));
+			for (const [key, value] of entries) {
+				if (key === QUERY_KEY) {
+					continue;
+				}
+				lines.push(...normalizeDisplayText(`${key}: ${jsonText(value, false)}`).split("\n"));
+			}
+			text = lines.join("\n");
+		}
 	}
-	return Object.fromEntries(Object.entries(record).filter(([key]) => !consumed.includes(key)));
+	return {
+		label: "Input",
+		component: new Text(text, 0, 0),
+		slot: "call",
+		preview: true,
+		previewPolicy: INPUT_PREVIEW,
+		renderedWidth: "padded",
+	};
 }
 
 /* -------------------------------------------------------------------------- */
@@ -715,18 +745,10 @@ function readWarnings(details: Record<string, unknown> | undefined): string[] | 
 	return lines.length > 0 ? lines : undefined;
 }
 
-function queryFromArgs(args: Record<string, unknown> | undefined): string | undefined {
-	const value = args?.query;
-	if (value === undefined || value === null) {
-		return undefined;
-	}
-	return typeof value === "string" ? value : INVALID_ARG;
-}
-
 /**
  * The response-provided search query, rendered as its own result section only
- * when the call carried no query of its own; the head then stays the single
- * place a query is shown.
+ * when the call carried no usable query of its own. A supplied query stays in
+ * Input, so the fallback never masquerades as supplied input.
  */
 function fallbackQuerySection(response: WebResponse, hasQueryArg: boolean): ToolSection | undefined {
 	if (hasQueryArg) {
@@ -765,27 +787,30 @@ function imageFallbackLines(snapshot: ToolSnapshot): string[] {
 
 /** Build the semantic view for one render revision of a recognised web tool. */
 export function createWebSearchView(toolName: string, snapshot: ToolSnapshot, theme: Theme): ToolView {
-	const args = asRecord(snapshot.args ?? snapshot.context.args);
-	const query = queryFromArgs(args);
+	// The snapshot carries the authoritative call arguments. An absent value means
+	// absent, so no fallback to the context copy may turn missing args into `{}`;
+	// delivered `null`/array/primitive values stay the call's literal input.
+	const rawArgs = snapshot.args;
+	const args = asRecord(rawArgs);
 	// Only a real string argument counts as a provided query: the invalid marker is
 	// a display placeholder, so a literal "[invalid arg]" query is still the query.
 	const hasQueryArg = typeof args?.query === "string";
-	const consumedArgs = remainingArgs(args, hasQueryArg ? ["query"] : []);
+	const inputBlock = webInputSection(rawArgs);
 	const details = asRecord(snapshot.result?.details);
 	const data = snapshot.result ? readWebResponse(snapshot.result) : undefined;
 
-	// Before a result: inline call card, the query once, the rest of the args kept.
+	// Before a result: the framed call card keeps every supplied argument in Input,
+	// and the identity-only header never carries the query.
 	if (!snapshot.result) {
 		return {
-			layout: "inline",
-			head: makeHead("Web Search", query ?? PENDING, [], snapshot),
-			sections: sectionsOf(argumentsSection(consumedArgs, snapshot.context.expanded)),
+			layout: "framed",
+			head: makeHead("Web Search", "", [], snapshot),
+			sections: [inputBlock],
 			expanded: snapshot.context.expanded,
 		};
 	}
 
 	const isError = snapshot.context.isError;
-	const argumentsBlock = argumentsSection(consumedArgs, snapshot.context.expanded);
 	const warningsLines = readWarnings(details);
 	const warningsBlock =
 		warningsLines !== undefined ? textSection(warningsLines, "result", false, "Warnings") : undefined;
@@ -822,8 +847,8 @@ export function createWebSearchView(toolName: string, snapshot: ToolSnapshot, th
 		const queryBlock = data !== undefined ? fallbackQuerySection(data.response, hasQueryArg) : undefined;
 		const view: ToolView = {
 			layout: "framed",
-			head: makeHead("Web Search", query ?? "", meta, snapshot),
-			sections: sectionsOf(argumentsBlock, queryBlock, errorBlock, imageBlock, warningsBlock, fullOutputBlock),
+			head: makeHead("Web Search", "", meta, snapshot),
+			sections: sectionsOf(inputBlock, queryBlock, errorBlock, imageBlock, warningsBlock, fullOutputBlock),
 			tone: "error",
 			expanded: snapshot.context.expanded,
 		};
@@ -839,9 +864,9 @@ export function createWebSearchView(toolName: string, snapshot: ToolSnapshot, th
 		const lines = text.length > 0 ? text.split("\n") : [];
 		const view: ToolView = {
 			layout: "framed",
-			head: makeHead("Web Search", query ?? "", [], snapshot),
+			head: makeHead("Web Search", "", [], snapshot),
 			sections: sectionsOf(
-				argumentsBlock,
+				inputBlock,
 				lines.length > 0
 					? markdownSection(
 							snapshot.context.state,
@@ -869,12 +894,9 @@ export function createWebSearchView(toolName: string, snapshot: ToolSnapshot, th
 	const providerLabel = searchProviderLabel(response.provider);
 	const meta = providerLabel.length > 0 ? [providerLabel] : [];
 
-	const sections: ToolSection[] = [];
-	if (argumentsBlock) {
-		sections.push(argumentsBlock);
-	}
+	const sections: ToolSection[] = [inputBlock];
 
-	// The args query stays in the head; only a result-provided fallback becomes a result section.
+	// The args query stays in Input; only a result-provided fallback becomes a result section.
 	const queryBlock = fallbackQuerySection(response, hasQueryArg);
 	if (queryBlock) {
 		sections.push(queryBlock);
@@ -944,7 +966,7 @@ export function createWebSearchView(toolName: string, snapshot: ToolSnapshot, th
 
 	const view: ToolView = {
 		layout: "framed",
-		head: makeHead("Web Search", query ?? "", meta, snapshot),
+		head: makeHead("Web Search", "", meta, snapshot),
 		sections,
 		expanded: snapshot.context.expanded,
 	};

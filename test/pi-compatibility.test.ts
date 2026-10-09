@@ -16,6 +16,7 @@ import { createToolHtmlRenderer } from "../node_modules/@earendil-works/pi-codin
 import { theme } from "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js";
 // Tests intentionally use Pi's pinned renderer implementation; production imports only package roots.
 import { editRenderers } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/tools/renderers/edit.js";
+import { codemodeRenderers } from "../node_modules/@earendil-works/pi-coding-agent/dist/extensions/codemode/renderer.js";
 import { layoutToolView } from "../src/frame.ts";
 
 const ui = () => ({ requestRender: vi.fn() });
@@ -36,6 +37,11 @@ function finish(component: ToolExecutionComponent, text = "RESULT_MARKER", isErr
 	component.updateResult({ content: [{ type: "text", text }], details: { diff: "  1 before\n- 2 removed\n+ 2 added", firstChangedLine: 2 }, isError, durationMs: 1250 }, partial);
 }
 const plain = (component: Component, width = 80) => component.render(width).map(stripTerminalSequences);
+function framedHeader(rows: readonly string[]): string {
+	const header = rows.find((row) => row.startsWith("╭"));
+	if (header === undefined) throw new Error("Expected a rendered framed tool header");
+	return header;
+}
 
 let configDirectory: string;
 let configPath: string;
@@ -438,26 +444,43 @@ function webResultFixture(): WebResultFixture {
 }
 
 describe("semantic views through real Pi components", () => {
-	it("renders Bash tail10, one command, recorded duration, and all output after expansion", () => {
+	for (const name of ["bash", "powershell"]) it(`renders ${name} command body before tail10 output without a Command divider or input in the header`, () => {
 		useSemanticPresentation();
-		const args = { command: "printf semantic-bash-command" };
-		const component = tool("bash", facade("bash", undefined, [nativeInfo("bash")]), args);
+		const args = { command: "printf FIRST_INPUT\nprintf SECOND_INPUT", timeout: 10 };
+		const component = tool(name, facade(name, undefined, [nativeInfo(name)]), args);
 		finish(component, semanticLines("B", 12));
-		const collapsed = plain(component).join("\n");
+		const collapsedRows = plain(component);
+		const collapsed = collapsedRows.join("\n");
+		const commandRow = name === "powershell" ? "PS> printf FIRST_INPUT" : "$ printf FIRST_INPUT";
+		expect(framedHeader(collapsedRows)).not.toContain("printf");
+		expect(collapsed).not.toContain("Command");
+		expect(collapsed).toContain(commandRow);
+		expect(collapsed).not.toContain("SECOND_INPUT");
+		expect(collapsed).toContain("1 more lines");
+		expect(collapsed.indexOf(commandRow)).toBeLessThan(collapsed.indexOf("Output"));
 		expect(collapsed).toContain("B03"); expect(collapsed).toContain("B12");
 		expect(collapsed).not.toContain("B01"); expect(collapsed).not.toContain("B02");
-		expect(collapsed.match(/semantic-bash-command/g)).toHaveLength(1);
+		expect(collapsed).toContain("2 more lines");
 		expect(collapsed).toContain("1.3s");
 		component.setExpanded(true);
-		expect(plain(component).join("\n")).toContain("B01");
+		const expandedRows = plain(component);
+		const expanded = expandedRows.join("\n");
+		expect(framedHeader(expandedRows)).not.toContain("printf");
+		expect(expanded).toContain("B01");
+		expect(expanded).toContain("SECOND_INPUT");
+		expect(expanded.match(/FIRST_INPUT/g)).toHaveLength(1);
+		expect(expanded.match(/SECOND_INPUT/g)).toHaveLength(1);
+		expect(expanded.indexOf("SECOND_INPUT")).toBeLessThan(expanded.indexOf("Output"));
 	});
 
-	it("renders Read head10 inline and Find five logical entries before expansion", () => {
+	it("renders Read head10 and Find five logical entries inside frames after their inputs", () => {
 		useSemanticPresentation();
 		const read = tool("read", facade("read", undefined, [nativeInfo("read")]), { path: "/tmp/example.txt" });
 		finish(read, semanticLines("R", 12));
 		const readRows = plain(read);
-		expect(readRows.some((row) => row.startsWith("╭"))).toBe(false);
+		expect(framedHeader(readRows)).toContain("Read");
+		expect(framedHeader(readRows)).not.toContain("example.txt");
+		expect(readRows.join("\n").indexOf("/tmp/example.txt")).toBeLessThan(readRows.join("\n").indexOf("Output"));
 		expect(readRows.join("\n")).toContain("R01"); expect(readRows.join("\n")).toContain("R10");
 		expect(readRows.join("\n")).not.toContain("R11");
 		read.setExpanded(true); expect(plain(read).join("\n")).toContain("R12");
@@ -498,13 +521,15 @@ describe("semantic views through real Pi components", () => {
 		expect(rows.join("\n")).not.toContain("W12");
 	});
 
-	it("replaces active Edit preview with the real final diff and retains one target", () => {
+	it("retains Edit input before the real final diff and renders its path only in the body", () => {
 		useSemanticPresentation();
 		const component = tool("edit", facade("edit", editRenderers, [nativeInfo("edit")]), { path: "/tmp/edit-fixture.txt", edits: [{ oldText: "PREVIEW_OLD", newText: "PREVIEW_NEW" }] });
 		expect(plain(component).join("\n")).toContain("PREVIEW_NEW");
 		component.updateResult({ content: [{ type: "text", text: "Edited fixture" }], details: { diff: "- 1 DIFF_OLD\n+ 1 DIFF_NEW", firstChangedLine: 1 }, isError: false, durationMs: 1250 }, false);
 		const rendered = plain(component).join("\n");
-		expect(rendered).toContain("DIFF_NEW"); expect(rendered).not.toContain("PREVIEW_NEW");
+		expect(rendered).toContain("DIFF_NEW"); expect(rendered).toContain("PREVIEW_NEW");
+		expect(rendered.indexOf("PREVIEW_NEW")).toBeLessThan(rendered.indexOf("DIFF_NEW"));
+		expect(framedHeader(plain(component))).not.toContain("edit-fixture.txt");
 		expect(rendered.match(/edit-fixture\.txt/g)).toHaveLength(1);
 	});
 
@@ -612,5 +637,557 @@ describe("sticky web promotion and independent actual HTML rendering", () => {
 		const expectedNative = untouched.renderResult("result-only", "web_search", result.content, result.details, false);
 		expect(native).toEqual(expectedNative);
 		expect(native?.expanded).toContain("HTML_PROVIDER_RESULT");
+	});
+});
+
+type ExecutionName = "ctx_execute" | "ctx_execute_file" | "codemode";
+interface ExecutionFixture {
+	name: ExecutionName;
+	args: Record<string, unknown>;
+	result: ToolResult & { isError: boolean; durationMs: number };
+}
+
+// Data-only context-mode contract fixture: never import the bridge that starts services.
+const contextModeRenderers: ToolRenderers = {
+	renderCall: (args) => {
+		const input = args as Record<string, unknown>;
+		return new Text(`CTX_NATIVE_CALL\n${JSON.stringify(input)}`, 0, 0);
+	},
+	renderResult: (result, options) => {
+		const text = result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
+		const body = options.expanded ? text : text.split(/\r?\n/u).find((line) => line.trim()) ?? "";
+		return new Text(`CTX_NATIVE_RESULT\n${body}`, 0, 0);
+	},
+};
+function executionDownstream(name: ExecutionName, shell: "default" | "self"): ToolRenderers {
+	return { ...(name === "codemode" ? codemodeRenderers : contextModeRenderers), renderShell: shell };
+}
+function contextEcho(name: ExecutionName, args: Record<string, unknown>): string {
+	const code = args.code as string;
+	const shown = code.length <= 2000 ? code : `${code.slice(0, 2000)}\n… (truncated)`;
+	return (name === "ctx_execute_file" && args.path ? `path=${args.path}\n` : "")
+		+ `\`\`\`${args.language}\n${shown}\n\`\`\`\n\n`;
+}
+function executionFixture(name: ExecutionName): ExecutionFixture {
+	const lines = Array.from({ length: 12 }, (_, index) => `INPUT_${String(index + 1).padStart(2, "0")}`);
+	const code = name === "ctx_execute_file" ? lines.map((line) => `print("${line}")`).join("\n")
+		: lines.map((line) => `console.log("${line}")`).join("\n");
+	const args = name === "codemode" ? { code: `// @options: {"timeout_ms":2500}\n${code}` }
+		: { language: name === "ctx_execute_file" ? "python" : "javascript", code, timeout: 2500,
+			...(name === "ctx_execute_file" ? { path: "/offline/does-not-exist.json", intent: "FILE_INTENT" }
+				: { background: false, cwd: "/offline/never-opened", intent: "CTX_INTENT" }) };
+	if (name !== "codemode") {
+		return { name, args, result: {
+			content: [{ type: "text", text: contextEcho(name, args) + semanticLines("OUTPUT_", 7) }],
+			details: {}, isError: false, durationMs: 1250,
+		} };
+	}
+	const calls = Array.from({ length: 9 }, (_, index) => ({
+		id: `nested/${index + 1}`, name: `nested_${String(index + 1).padStart(2, "0")}`,
+		args: JSON.stringify({ marker: `CALL_${index + 1}`, long: "a".repeat(90), tail: "NESTED_ARGS_END" }),
+		status: index === 1 ? "running" : index === 3 ? "error" : index === 4 ? "cancelled" : "ok",
+		durationMs: (index + 1) * 10,
+		...(index === 3 ? { error: "NESTED_ERROR\nERROR_DETAIL" } : {}),
+		...(index === 0 ? { cost: 0.10 } : index === 8 ? { cost: 0.20 } : {}),
+	}));
+	return { name, args, result: {
+		content: [
+			{ type: "text", text: "Script completed\nWall time 0.125 seconds\nOutput:\n" },
+			{ type: "text", text: "==> text 1/2 <==\nOUTPUT_01\nOUTPUT_02\nOUTPUT_03" },
+			{ type: "text", text: "==> text 2/2 <==\n<console_output>\nOUTPUT_04\nOUTPUT_05\nOUTPUT_06\nOUTPUT_07\n</console_output>\n[Output truncated]" },
+		],
+		details: { calls, fullOutputPath: "/offline/codemode-full.txt" },
+		isError: false, durationMs: 1250,
+	} };
+}
+function updateExecution(component: ToolExecutionComponent, result: ExecutionFixture["result"], partial = false) {
+	component.markExecutionStarted();
+	component.updateResult(result, partial);
+}
+
+describe("execution ownership through real Pi components", () => {
+	for (const name of ["ctx_execute", "ctx_execute_file", "codemode"] as const) {
+		for (const shell of ["default", "self"] as const) for (const outputPad of [0, 1, 2]) {
+			it(`renders owned ${name} input/output and restores exact ${shell} native slots, padding=${outputPad}`, () => {
+				useSemanticPresentation();
+				const fixture = executionFixture(name);
+				const downstream = executionDownstream(name, shell);
+				const metadata = name === "codemode" ? [nativeInfo(name)] : [];
+				const decorated = tool(name, facade(name, downstream, metadata), fixture.args, outputPad);
+				const native = tool(name, downstream, fixture.args, outputPad);
+				updateExecution(decorated, fixture.result); updateExecution(native, fixture.result);
+				const collapsedRows = plain(decorated);
+				const collapsed = collapsedRows.join("\n");
+				expect(framedHeader(collapsedRows)).toContain(name);
+				expect(framedHeader(collapsedRows)).not.toContain("INPUT_");
+				expect(collapsedRows.filter((row) => row.startsWith("╭"))).toHaveLength(1);
+				expect(collapsed).not.toMatch(/├─+ Input ─/u);
+				expect(collapsed).toContain("INPUT_01");
+				expect(collapsed).not.toContain("INPUT_12");
+				expect(collapsed.match(/INPUT_01/g)).toHaveLength(1);
+				expect(collapsed).toContain("Output");
+				expect(collapsed).toContain("OUTPUT_01");
+				expect(collapsed).not.toContain("OUTPUT_07");
+				expect(collapsed.indexOf("INPUT_01")).toBeLessThan(collapsed.indexOf("OUTPUT_01"));
+				expect(collapsed).toContain("1.3s");
+				expect(collapsed).not.toContain("CTX_NATIVE");
+				expect(collapsed).not.toContain("Script completed");
+				expect(collapsed).not.toContain("```");
+				if (name === "codemode") {
+					expect(collapsed).toContain("// @options:");
+					expect(collapsed).toContain("Calls");
+					expect(collapsed).toContain("nested_02");
+					expect(collapsed).toContain("nested_09");
+					expect(collapsed).not.toContain("nested_01");
+					expect(collapsed).toContain("1 more entries");
+					expect(collapsed).toContain("3 more lines");
+					expect(collapsed).toContain("Model calls: $0.30");
+					expect(collapsed).toContain("Full output: /offline/codemode-full.txt");
+					expect(collapsed).toContain("... nested_02");
+					expect(collapsed).toContain("! nested_04");
+					expect(collapsed).toContain("- nested_05");
+					expect(collapsed).toContain("ok nested_09");
+					expect(collapsed.indexOf("Calls")).toBeLessThan(collapsed.indexOf("Output"));
+				} else {
+					expect(collapsed.match(/2 more lines/g)).toHaveLength(2);
+					expect(collapsed).toContain("language:");
+					expect(collapsed).toContain("2500");
+					expect(collapsed).toContain("ms");
+					if (name === "ctx_execute_file") expect(collapsed).toContain("/offline/does-not-exist.json");
+					else expect(collapsed).toContain("background: false");
+				}
+				for (const expanded of [false, true]) {
+					decorated.setExpanded(expanded); native.setExpanded(expanded);
+					for (const width of [24, 80, 120]) {
+						setToolRendererEnabled(true);
+						const styled = decorated.render(width);
+						expect(styled).not.toEqual(native.render(width));
+						expect(styled.every((row) => visibleWidth(row) <= width)).toBe(true);
+						setToolRendererEnabled(false);
+						expect(decorated.render(width)).toEqual(native.render(width));
+						setToolRendererEnabled(true);
+						expect(decorated.render(width)).toEqual(styled);
+					}
+				}
+				const expanded = plain(decorated).join("\n");
+				expect(expanded).toContain("INPUT_12");
+				expect(expanded).toContain("OUTPUT_07");
+				expect(expanded.match(/INPUT_01/g)).toHaveLength(1);
+				expect(expanded.indexOf("INPUT_12")).toBeLessThan(expanded.indexOf("Output"));
+				if (name === "codemode") {
+					expect(expanded).toContain("nested_01");
+					expect(expanded).toContain("NESTED_ARGS_END");
+					expect(expanded).toContain("NESTED_ERROR");
+					expect(expanded).toContain("ERROR_DETAIL");
+					expect(expanded).toContain("==> text 1/2 <==");
+					expect(expanded).toContain("==> text 2/2 <==");
+					expect(expanded).toContain("<console_output>");
+					expect(expanded).toContain("[Output truncated]");
+					expect(expanded).toContain("Full output: /offline/codemode-full.txt");
+				}
+			});
+		}
+
+		for (const choice of ["global", "name"] as const) it(`updates ${name} while ${choice} presentation is OFF and restores its current owned card`, async () => {
+			useSemanticPresentation();
+			const fixture = executionFixture(name);
+			const downstream = executionDownstream(name, "self");
+			const decorated = tool(name, facade(name, downstream, [nativeInfo(name)]), fixture.args);
+			const native = tool(name, downstream, fixture.args);
+			updateExecution(decorated, fixture.result); updateExecution(native, fixture.result);
+			expect(plain(decorated).join("\n")).toContain("INPUT_01");
+			const otherName = name === "ctx_execute" ? "ctx_execute_file" : "ctx_execute";
+			const otherFixture = executionFixture(otherName);
+			const other = tool(otherName, facade(otherName, executionDownstream(otherName, "self")), otherFixture.args);
+			updateExecution(other, otherFixture.result);
+			if (choice === "name") {
+				await saveSettings({ tools: { [name]: false } }, configPath);
+				invalidateToolPresentations(name);
+				expect(plain(other).join("\n")).toContain("INPUT_01");
+				expect(plain(other).join("\n")).not.toContain("CTX_NATIVE");
+			} else {
+				setToolRendererEnabled(false);
+				expect(plain(other).join("\n")).toContain("CTX_NATIVE");
+			}
+			for (const expanded of [false, true]) {
+				decorated.setExpanded(expanded); native.setExpanded(expanded);
+				for (const width of [24, 80, 120]) expect(decorated.render(width)).toEqual(native.render(width));
+			}
+			const updatedArgs = { ...fixture.args, code: 'console.log("UPDATED_WHILE_OFF")' };
+			decorated.updateArgs(updatedArgs); native.updateArgs(updatedArgs);
+			const updatedResult: ExecutionFixture["result"] = {
+				...fixture.result, isError: true,
+				content: name === "codemode"
+					? [{ type: "text", text: "Script failed\nWall time 0.125 seconds\nOutput:\n" }, { type: "text", text: "OFF_ERROR_OUTPUT" }]
+					: [{ type: "text", text: contextEcho(name, updatedArgs) + "OFF_ERROR_OUTPUT" }],
+			};
+			updateExecution(decorated, updatedResult); updateExecution(native, updatedResult);
+			for (const width of [24, 80, 120]) expect(decorated.render(width)).toEqual(native.render(width));
+			if (choice === "name") {
+				await saveSettings({ tools: { [name]: true } }, configPath);
+				invalidateToolPresentations(name);
+			} else setToolRendererEnabled(true);
+			const restoredRows = plain(decorated);
+			const restored = restoredRows.join("\n");
+			expect(framedHeader(restoredRows)).toContain("!");
+			expect(restored).not.toMatch(/├─+ Input ─/u);
+			expect(restored).toContain("UPDATED_WHILE_OFF");
+			expect(restored).toContain("Output");
+			expect(restored).toContain("OFF_ERROR_OUTPUT");
+			expect(restored).not.toContain("INPUT_01");
+			expect(restored).not.toContain("CTX_NATIVE");
+			expect(restored).not.toContain("Script failed");
+			expect(decorated.render(80)).not.toEqual(native.render(80));
+		});
+
+		it(`keeps ${name} streamed input, partial calls/output, errors and empty results current on one real instance`, () => {
+			useSemanticPresentation();
+			const fixture = executionFixture(name);
+			const downstream = executionDownstream(name, "self");
+			const decorated = tool(name, facade(name, downstream), {});
+			const native = tool(name, downstream, {});
+			const pending = plain(decorated).join("\n");
+			expect(pending).not.toMatch(/├─+ Input ─/u);
+			expect(pending).toContain("…");
+			expect(pending).not.toContain("Output");
+			const streamedArgs = { ...fixture.args, code: 'console.log("STREAM_INPUT")' };
+			decorated.updateArgs(streamedArgs); native.updateArgs(streamedArgs);
+			const partialResult: ExecutionFixture["result"] = {
+				content: [{ type: "text", text: name === "codemode" ? "MUST_NOT_SHOW_PARTIAL_OUTPUT" : contextEcho(name, streamedArgs) + "PARTIAL_OUTPUT" }],
+				details: name === "codemode"
+					? { calls: [{ id: "partial/1", name: "PARTIAL_NESTED", args: '{"phase":"running"}', status: "running" }] } : {},
+				isError: false, durationMs: 1250,
+			};
+			updateExecution(decorated, partialResult, true); updateExecution(native, partialResult, true);
+			const partial = plain(decorated).join("\n");
+			expect(partial).not.toMatch(/├─+ Input ─/u);
+			expect(partial).toContain("STREAM_INPUT");
+			if (name === "codemode") {
+				expect(partial).toContain("Calls");
+				expect(partial).toContain("PARTIAL_NESTED");
+				expect(partial).toContain("... PARTIAL_NESTED");
+				expect(partial).not.toContain("Output");
+				expect(partial).not.toContain("MUST_NOT_SHOW_PARTIAL_OUTPUT");
+			} else {
+				expect(partial).toContain("Output");
+				expect(partial).toContain("PARTIAL_OUTPUT");
+				expect(partial).not.toContain("```");
+			}
+			setToolRendererEnabled(false);
+			expect(decorated.render(80)).toEqual(native.render(80));
+			setToolRendererEnabled(true);
+			decorated.updateArgs(fixture.args); native.updateArgs(fixture.args);
+			decorated.setArgsComplete(); native.setArgsComplete();
+			const errorResult: ExecutionFixture["result"] = {
+				content: [{ type: "text", text: "INVALID_OPTIONS_ERROR\nERROR_DETAIL" }],
+				details: name === "codemode"
+					? { calls: [{ id: "partial/1", name: "PARTIAL_NESTED", args: '{"phase":"failed"}', status: "error", error: "NESTED_FAILURE" }] } : {},
+				isError: true, durationMs: 1250,
+			};
+			updateExecution(decorated, errorResult); updateExecution(native, errorResult);
+			const error = plain(decorated);
+			expect(framedHeader(error)).toContain("!");
+			expect(error.join("\n")).not.toMatch(/├─+ Input ─/u);
+			expect(error.join("\n")).toContain("Output");
+			expect(error.join("\n")).toContain("INVALID_OPTIONS_ERROR");
+			expect(error.join("\n")).toContain("ERROR_DETAIL");
+			setToolRendererEnabled(false);
+			for (const width of [24, 80, 120]) expect(decorated.render(width)).toEqual(native.render(width));
+			setToolRendererEnabled(true);
+			finish(decorated, ""); finish(native, "");
+			const empty = plain(decorated).join("\n");
+			expect(empty).not.toMatch(/├─+ Input ─/u);
+			expect(empty).not.toContain("Output");
+			expect(empty).not.toContain("INVALID_OPTIONS_ERROR");
+			expect(empty).not.toContain("(no output)");
+			setToolRendererEnabled(false);
+			expect(decorated.render(80)).toEqual(native.render(80));
+			setToolRendererEnabled(true);
+			expect(plain(decorated).join("\n")).toBe(empty);
+		});
+
+		it(`keeps ${name} malformed, empty and whitespace code visible before any result`, () => {
+			useSemanticPresentation();
+			const fixture = executionFixture(name);
+			const downstream = executionDownstream(name, "self");
+			const decorated = tool(name, facade(name, downstream), fixture.args);
+			const native = tool(name, downstream, fixture.args);
+			for (const code of [123, "", " \t\n "]) {
+				const args = { ...fixture.args, code };
+				decorated.updateArgs(args); native.updateArgs(args);
+				const input = plain(decorated).join("\n");
+				expect(input).not.toMatch(/├─+ Input ─/u);
+				expect(input).toContain(typeof code === "string" ? `code: ${JSON.stringify(code)}` : "[invalid arg]");
+				expect(input).not.toContain("Output");
+				expect(input).not.toContain("CTX_NATIVE");
+				setToolRendererEnabled(false);
+				expect(decorated.render(80)).toEqual(native.render(80));
+				setToolRendererEnabled(true);
+				expect(plain(decorated).join("\n")).toBe(input);
+			}
+		});
+
+		it(`keeps ${name} normalized-empty code visible as a safe compact literal`, () => {
+			useSemanticPresentation();
+			const fixture = executionFixture(name);
+			const component = tool(name, facade(name, executionDownstream(name, "self")), fixture.args);
+			for (const { code, literal } of [
+				{ code: "\u001b[31m\u001b[0m", literal: '"\\u001b[31m\\u001b[0m"' },
+				{ code: "\ufdd0", literal: '""' },
+			]) {
+				component.updateArgs({ ...fixture.args, code });
+				finish(component, "");
+				for (const expanded of [false, true]) {
+					component.setExpanded(expanded);
+					const rows = component.render(80);
+					const input = rows.map(stripTerminalSequences).join("\n");
+					expect(input).not.toMatch(/├─+ Input ─/u);
+					expect(input).toContain(`code: ${literal}`);
+					expect(input).not.toContain("CTX_NATIVE");
+					expect(rows.join("\n")).not.toContain(code === "\ufdd0" ? code : "\u001b[31m");
+				}
+			}
+		});
+
+		it(`restores ${name} exact Pi fallback when no downstream renderer was captured`, () => {
+			useSemanticPresentation();
+			const fixture = executionFixture(name);
+			const decorated = tool(name, facade(name, undefined), fixture.args);
+			const native = tool(name, undefined, fixture.args);
+			updateExecution(decorated, fixture.result); updateExecution(native, fixture.result);
+			const styled = plain(decorated).join("\n");
+			expect(styled).not.toMatch(/├─+ Input ─/u);
+			expect(styled).toContain("Output");
+			expect(styled).toContain("INPUT_01");
+			expect(styled).toContain("OUTPUT_01");
+			for (const expanded of [false, true]) {
+				decorated.setExpanded(expanded); native.setExpanded(expanded);
+				setToolRendererEnabled(false);
+				for (const width of [24, 80, 120]) expect(decorated.render(width)).toEqual(native.render(width));
+				setToolRendererEnabled(true);
+				expect(plain(decorated).join("\n")).not.toMatch(/├─+ Input ─/u);
+				expect(plain(decorated).join("\n")).toContain("Output");
+			}
+		});
+
+		for (const shell of ["default", "self"] as const) {
+			it(`restores exact ${name} ${shell} native rendering for narrow widths and presentation failures`, () => {
+				useSemanticPresentation();
+				const fixture = executionFixture(name);
+				const downstream = executionDownstream(name, shell);
+				const decorated = tool(name, facade(name, downstream), fixture.args);
+				const native = tool(name, downstream, fixture.args);
+				updateExecution(decorated, fixture.result); updateExecution(native, fixture.result);
+				expect(plain(decorated).join("\n")).not.toMatch(/├─+ Input ─/u);
+				expect(plain(decorated).join("\n")).toContain("Output");
+				for (const expanded of [false, true]) {
+					decorated.setExpanded(expanded); native.setExpanded(expanded);
+					expect(decorated.render(4)).toEqual(native.render(4));
+				}
+				for (const fail of ["factory", "layout"] as const) {
+					setToolRendererImplementation({
+						createToolView: fail === "factory" ? () => { throw new Error("fixture presentation failure"); } : createToolView,
+						layoutToolView: fail === "layout" ? () => { throw new Error("fixture layout failure"); } : layoutToolView,
+					});
+					for (const width of [24, 80, 120]) expect(decorated.render(width)).toEqual(native.render(width));
+				}
+				useSemanticPresentation();
+				expect(plain(decorated).join("\n")).not.toMatch(/├─+ Input ─/u);
+				expect(plain(decorated).join("\n")).toContain("Output");
+			});
+		}
+	}
+});
+
+describe("uniform framed real tool surfaces", () => {
+	const fixtures = [
+		{ name: "bash", args: { command: "echo INPUT_A\necho INPUT_B" }, input: "INPUT_A", label: "Command" },
+		{ name: "powershell", args: { command: "echo INPUT_A\necho INPUT_B" }, input: "INPUT_A", label: "Command" },
+		{ name: "read", args: { path: "/offline/INPUT_PATH" }, input: "INPUT_PATH", label: "Input" },
+		{ name: "find", args: { pattern: "INPUT_PATTERN", path: "/offline" }, input: "INPUT_PATTERN", label: "Input" },
+		{ name: "grep", args: { pattern: "INPUT_PATTERN", path: "/offline" }, input: "INPUT_PATTERN", label: "Input" },
+		{ name: "ls", args: { path: "/offline/INPUT_PATH" }, input: "INPUT_PATH", label: "Input" },
+		{ name: "write", args: { path: "/offline/INPUT_PATH", content: semanticLines("WRITE_INPUT_", 12) }, input: "INPUT_PATH", label: "Input" },
+		{ name: "edit", args: { path: "/offline/INPUT_PATH", edits: [{ oldText: "EDIT_OLD", newText: "EDIT_INPUT" }] }, input: "INPUT_PATH", label: "Input" },
+	];
+	for (const fixture of fixtures) for (const outputPad of [0, 1, 2]) {
+		it(`frames ${fixture.name} input before output with exact native restoration, padding=${outputPad}`, () => {
+			useSemanticPresentation();
+			const downstream = fixture.name === "edit" ? editRenderers : undefined;
+			const component = tool(fixture.name, facade(fixture.name, downstream, [nativeInfo(fixture.name)]), fixture.args, outputPad);
+			const native = tool(fixture.name, downstream, fixture.args, outputPad);
+			finish(component, semanticLines("OUTPUT_", 15)); finish(native, semanticLines("OUTPUT_", 15));
+			for (const expanded of [false, true]) {
+				component.setExpanded(expanded); native.setExpanded(expanded);
+				for (const width of [24, 80, 120]) {
+					setToolRendererEnabled(true);
+					const rows = plain(component, width);
+					const rendered = rows.join("\n");
+					expect(framedHeader(rows)).not.toContain(fixture.input);
+					if (fixture.label === "Input") expect(rendered).not.toMatch(/├─+ Input ─/u);
+					else expect(rendered).not.toContain("Command");
+					const outputLabel = fixture.name === "edit" ? "Diff" : "Output";
+					expect(rendered).toContain(outputLabel);
+					expect(rendered.indexOf(fixture.input)).toBeLessThan(rendered.indexOf(outputLabel));
+					const outputDivider = rows.findIndex((row) => row.startsWith("├") && row.includes(outputLabel));
+					expect(outputDivider).toBeGreaterThan(0);
+					// Only rejoin the Input body's wrapped content; dividers, borders and
+					// renderer padding are not delivered argument characters.
+					const inputContent = rows.slice(0, outputDivider)
+						.filter((row) => row.startsWith("│"))
+						.map((row) => row.slice(1, row.lastIndexOf("│")).trim())
+						.join("");
+					expect(inputContent).toContain(fixture.input);
+					if ("path" in fixture.args) expect(inputContent).toContain(fixture.args.path);
+					expect(rows.filter((row) => row.startsWith("╭"))).toHaveLength(1);
+					expect(rows.filter((row) => row.startsWith("╰"))).toHaveLength(1);
+					expect(rows.every((row) => visibleWidth(row) <= width)).toBe(true);
+					if (fixture.name === "write") expect(rendered).toContain("WRITE_INPUT_01");
+					if (fixture.name === "edit") {
+						expect(rendered).toContain("EDIT_INPUT");
+						expect(rendered).toContain("added");
+						expect(rendered.indexOf("EDIT_INPUT")).toBeLessThan(rendered.indexOf("added"));
+					}
+					setToolRendererEnabled(false);
+					expect(component.render(width)).toEqual(native.render(width));
+					setToolRendererEnabled(true);
+					expect(plain(component, width)).toEqual(rows);
+				}
+			}
+		});
+	}
+
+	it("frames a genuine rich third-party body with independent bounded Input and Output previews", () => {
+		useSemanticPresentation();
+		const downstream: ToolRenderers = {
+			renderCall: () => new Text(semanticLines("RICH_INPUT_", 14), 0, 0),
+			renderResult: () => new Text(semanticLines("RICH_OUTPUT_", 14), 0, 0),
+		};
+		const component = tool("rich_extension", facade("rich_extension", downstream), {}, 2);
+		const native = tool("rich_extension", downstream, {}, 2);
+		finish(component); finish(native);
+		const rows = plain(component);
+		const collapsed = rows.join("\n");
+		expect(framedHeader(rows)).toContain("rich_extension");
+		expect(collapsed).not.toMatch(/├─+ Input ─/u); expect(collapsed).toContain("Output");
+		expect(collapsed).toContain("RICH_INPUT_01"); expect(collapsed).toContain("RICH_OUTPUT_01");
+		expect(collapsed).not.toContain("RICH_INPUT_14"); expect(collapsed).not.toContain("RICH_OUTPUT_14");
+		expect(collapsed.match(/more lines/g)).toHaveLength(2);
+		expect(collapsed.indexOf("RICH_INPUT_01")).toBeLessThan(collapsed.indexOf("Output"));
+		component.setExpanded(true); native.setExpanded(true);
+		for (const width of [24, 80, 120]) {
+			const expanded = plain(component, width).join("\n");
+			expect(expanded).toContain("RICH_INPUT_14"); expect(expanded).toContain("RICH_OUTPUT_14");
+			setToolRendererEnabled(false); expect(component.render(width)).toEqual(native.render(width));
+			setToolRendererEnabled(true); expect(plain(component, width).join("\n")).toBe(expanded);
+		}
+	});
+
+	for (const resource of [false, true]) it(`keeps MCP ${resource ? "resource URI" : "tool arguments"} in Input, not its identity header`, () => {
+		useSemanticPresentation();
+		const name = resource ? "mcp__docs__read_resource" : "mcp__docs__lookup";
+		const metadata = nativeInfo(name); metadata.sourceInfo.path = "builtin:mcp";
+		const args = resource ? { uri: "docs://INPUT_RESOURCE" } : { query: "INPUT_QUERY", limit: 0 };
+		const component = tool(name, facade(name, undefined, [metadata]), args);
+		component.updateResult({ content: [{ type: "text", text: semanticLines("MCP_OUTPUT_", 8) }], details: { server: "docs", tool: resource ? "read_resource" : "lookup" }, isError: false }, false);
+		const rows = plain(component), rendered = rows.join("\n");
+		expect(framedHeader(rows)).not.toContain("INPUT_");
+		expect(rendered).toContain(resource ? "docs://INPUT_RESOURCE" : "INPUT_QUERY");
+		expect(rendered.indexOf(resource ? "docs://INPUT_RESOURCE" : "INPUT_QUERY")).toBeLessThan(rendered.indexOf("Output"));
+		expect(rendered).not.toContain("MCP_OUTPUT_06");
+		component.setExpanded(true); expect(plain(component).join("\n")).toContain("MCP_OUTPUT_08");
+	});
+
+	it("places structured web query in Input before rich Answer and Sources", () => {
+		useSemanticPresentation();
+		const component = tool("web_search", facade("web_search", undefined), { query: "INPUT_QUERY" });
+		component.updateResult(webResultFixture(), false);
+		const rows = plain(component), rendered = rows.join("\n");
+		expect(framedHeader(rows)).not.toContain("INPUT_QUERY");
+		expect(rendered).not.toMatch(/├─+ Input ─/u);
+		expect(rendered.indexOf("INPUT_QUERY")).toBeLessThan(rendered.indexOf("Answer"));
+		expect(rendered).toContain("ANSWER_MARKER"); expect(rendered).toContain("SOURCE_08");
+		expect(rendered).not.toContain("RAW_TEXT_WITHOUT_SOURCE_TITLES");
+	});
+
+	it("keeps pending, partial, empty and failed native-tool inputs current without inventing output", () => {
+		useSemanticPresentation();
+		const component = tool("read", facade("read", undefined, [nativeInfo("read")]), { path: "/offline/PENDING_INPUT" });
+		expect(plain(component).join("\n")).not.toMatch(/├─+ Input ─/u);
+		expect(plain(component).join("\n")).not.toContain("Output");
+		component.updateArgs({ path: "/offline/UPDATED_INPUT" });
+		finish(component, "PARTIAL_OUTPUT", false, true);
+		expect(plain(component).join("\n")).toContain("UPDATED_INPUT");
+		expect(plain(component).join("\n")).toContain("PARTIAL_OUTPUT");
+		finish(component, "");
+		expect(plain(component).join("\n")).toContain("UPDATED_INPUT");
+		expect(plain(component).join("\n")).not.toContain("Output");
+		finish(component, "FAILURE_OUTPUT", true);
+		const rows = plain(component);
+		expect(framedHeader(rows)).toContain("!");
+		expect(rows.join("\n")).toContain("FAILURE_OUTPUT");
+		expect(rows.join("\n")).not.toContain("PARTIAL_OUTPUT");
+	});
+});
+
+describe("uniform rich-body animation and interaction invariants", () => {
+	it("does not truncate an interactive rich child while independently previewing its noninteractive sibling", () => {
+		useSemanticPresentation();
+		const input = new Text(semanticLines("STATIC_INPUT_", 14), 0, 0);
+		const output = new Text(semanticLines("LIVE_OUTPUT_", 14), 0, 0);
+		const events: TuiMouseEvent[] = [];
+		const interactive: Component = {
+			render: (width) => output.render(width),
+			invalidate: () => output.invalidate(),
+			handleInput: vi.fn(),
+			handleMouse: (event) => { events.push(event); return { handled: true, focus: true, capture: true }; },
+		};
+		const downstream: ToolRenderers = { renderCall: () => input, renderResult: () => interactive };
+		const component = tool("interactive_rich", facade("interactive_rich", downstream), {}, 2);
+		finish(component);
+		for (const width of [24, 80, 120]) {
+			const rows = plain(component, width), rendered = rows.join("\n");
+			expect(rendered).toContain("STATIC_INPUT_01");
+			expect(rendered).not.toContain("STATIC_INPUT_14");
+			expect(rendered).toContain("LIVE_OUTPUT_14");
+			const y = rows.findIndex((row) => row.includes("LIVE_OUTPUT_01"));
+			const event: TuiMouseEvent = { type: "press", button: "left", x: 3, y, screenX: 3, screenY: y, width, height: rows.length, shift: false, alt: false, ctrl: false };
+			const dispatched = component.handleMouse(event) as { target: { component: Component }; focusTarget: Component };
+			expect(dispatched.target.component).toBe(interactive);
+			expect(dispatched.focusTarget).toBe(interactive);
+			expect(events.at(-1)?.y).toBe(0);
+			dispatched.focusTarget.handleInput!("key");
+			expect(interactive.handleInput).toHaveBeenCalledWith("key");
+		}
+	});
+
+	for (const name of ["read", "rich_tick"]) it(`retains ${name} prepared body and geometry during genuine loader ticks`, () => {
+		useSemanticPresentation();
+		const input = new Text(semanticLines("TICK_INPUT_", 14), 0, 0);
+		const output = new Text(semanticLines("TICK_OUTPUT_", 14), 0, 0);
+		const inputRender = vi.spyOn(input, "render"), outputRender = vi.spyOn(output, "render");
+		const downstream = name === "read" ? undefined : { renderCall: () => input, renderResult: () => output };
+		const layouts: ToolLayout[] = [];
+		const factory = vi.fn(createToolView);
+		const layout = vi.fn((...args: Parameters<typeof layoutToolView>) => {
+			const prepared = layoutToolView(...args); layouts.push(prepared); return prepared;
+		});
+		setToolRendererImplementation({ createToolView: factory, layoutToolView: layout });
+		const component = tool(name, facade(name, downstream, name === "read" ? [nativeInfo(name)] : []), { path: "/offline/TICK_PATH" });
+		finish(component, semanticLines("TICK_OUTPUT_", 14), false, true);
+		const before = plain(component);
+		const body = before.slice(before.findIndex((row) => row.startsWith("╭")) + 1);
+		const prepared = layouts.at(-1)!;
+		const callRows = prepared.callRows, resultRows = prepared.resultRows;
+		const callBounds = prepared.callChildBounds, resultBounds = prepared.resultChildBounds;
+		const counts = [factory.mock.calls.length, layout.mock.calls.length, inputRender.mock.calls.length, outputRender.mock.calls.length];
+		for (let tick = 0; tick < 3; tick++) {
+			vi.advanceTimersByTime(80);
+			const after = plain(component);
+			expect(after.slice(after.findIndex((row) => row.startsWith("╭")) + 1)).toEqual(body);
+			expect([factory.mock.calls.length, layout.mock.calls.length, inputRender.mock.calls.length, outputRender.mock.calls.length]).toEqual(counts);
+			expect(prepared.callRows).toBe(callRows); expect(prepared.resultRows).toBe(resultRows);
+			expect(prepared.callChildBounds).toBe(callBounds); expect(prepared.resultChildBounds).toBe(resultBounds);
+		}
 	});
 });

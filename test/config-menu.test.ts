@@ -41,6 +41,11 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+	// The menu fire-and-forgets onChange (`void pending.then(...)`), so a test can end while a
+	// real settings write is still mkdir/writeFile/rename-ing under root. Drain the shared
+	// writer first: otherwise the recursive rmdir races the in-flight write, which recreates
+	// entries inside root, and rm fails ENOTEMPTY.
+	await flushSettingsWrites();
 	await rm(root, { force: true, recursive: true });
 	setToolRendererEnabled(true);
 });
