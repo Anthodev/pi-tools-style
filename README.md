@@ -3,7 +3,7 @@
 <p align="center"><strong>Give Pi tool activity clear, theme-aware structure without changing how tools run.</strong></p>
 
 > [!NOTE]
-> The published npm `0.1.4` release still targets Pi `1.0.x` with the previous private-renderer approach. The Pi `1.1.x` middleware support, semantic cards, and MCP, web-search, and execution views described on this page exist in this repository's checkout and will ship with the next release. Until then, install this checkout locally to use them.
+> The published npm `0.1.4` release still targets Pi `1.0.x`. Version `0.2.0`, which moves to Pi `1.1.x` and the middleware support, semantic cards, and MCP, web-search, and execution views described on this page.
 
 `pi-tools-style` gives Pi tool calls and direct shell commands clear semantic structure: status, duration, and identity in a card head, command and content in framed sections, bounded previews that expand in place with `Ctrl+O`, and colors that follow the active theme. It draws through Pi's public tool-renderer middleware and never registers or replaces a tool.
 

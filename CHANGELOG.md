@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-11
+
+### Features
+
+- feat(rendering)!: add OMP-style tool views and per-tool configuration ([c036929](https://github.com/Anthodev/pi-tools-style/commit/c036929082ac00b6ecf4033c7753aebaae5db371))
+  - Breaking for consumers on Pi `1.0.x`: the published `0.1.4` package targeted Pi `1.0.x`, so `0.2.0` moves the supported peer range to Pi `>=1.1.0 <2`. Update Pi to `1.1.x` before installing this release.
+  - Adds semantic tool, MCP, and web-search views with per-tool settings; disabling styling restores the captured native rendering.
+- feat(rendering): unify framed tool inputs and execution views ([01fb182](https://github.com/Anthodev/pi-tools-style/commit/01fb182683428e7418dbeee1ffe468069e4dc5ec))
+  - Applies the same framed input-then-result layout to every supported tool, with the supplied data under the head and no `Input` or `Command` divider.
+
+**Full changelog**: https://github.com/Anthodev/pi-tools-style/compare/v0.1.4...v0.2.0
+
 ## [0.1.4] - 2026-10-03
 
 ### Changes
